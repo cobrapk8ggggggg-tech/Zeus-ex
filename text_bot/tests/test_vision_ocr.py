@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from PIL import Image
 from utils.providers import ProcessingConfig
-from utils.vision_ocr import make_crops, parse_regions, extract_page, reconcile_audit
+from utils.vision_ocr import make_crops, parse_regions, extract_page, reconcile_audit, refine_small_regions
 
 
 def sample(height=10195):
@@ -64,3 +64,13 @@ class VisionTests(unittest.TestCase):
         with patch("utils.vision_ocr.complete_external", return_value=raw) as request:
             extract_page(data, "test.png", ProcessingConfig(provider="gpt", ocr_double_check=False))
         self.assertLessEqual(request.call_count, len(make_crops(data, "test.png")) + 4)
+
+    def test_long_number_keeps_a_rescue_slot_after_earlier_dense_panels(self):
+        crop = make_crops(sample(1000), "test.png")[0]
+        ordinary = [{**region("Long UI: " + "A" * 200, [0, 100 * i, 900, 100 * i + 80]), "kind": "ui"} for i in range(4)]
+        number = {**region("异能量：221066491亿5999万9015", [0, 800, 900, 900]), "kind": "ui"}
+        raw = json.dumps({"regions": [region("22106649亿5999万9075", [0, 0, 900, 900])]})
+        with patch("utils.vision_ocr.complete_external", return_value=raw) as request:
+            result = refine_small_regions(crop, ordinary + [number], ProcessingConfig(provider="gpt"), [4], [1])
+        self.assertEqual(request.call_count, 4)
+        self.assertTrue(any(r["text"] == "22106649亿5999万9075" for r in result))

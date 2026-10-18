@@ -62,6 +62,7 @@ def run_validation(api, marker, folder, mode="full"):
     print("[ZEUS_VALIDATION] " + json.dumps({"run": marker, "event": "resumed" if previous else "started", "completed_pages": len(report["pages"])}), flush=True)
     try:
         config = get_processing_config()
+        report["model"] = config.chatgpt_model
         for provider, configured in (("gpt", bool(config.chatgpt_access_token)), ("gemini", bool(config.gemini_cookie_header))):
             if not configured:
                 report["accounts"][provider] = {"status": "not_configured"}
@@ -82,6 +83,7 @@ def run_validation(api, marker, folder, mode="full"):
                 report["accounts"][provider] = summary
             except Exception as exc:
                 report["accounts"][provider] = {"status": "failed", "error": api.sanitize_error(exc)}
+        print("[ZEUS_VALIDATION_ACCOUNTS] " + json.dumps({"accounts": report["accounts"], "model": config.chatgpt_model}, ensure_ascii=False), flush=True)
         if mode == "accounts":
             report["status"] = "completed"
             return
