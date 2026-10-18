@@ -74,3 +74,5 @@ class VisionTests(unittest.TestCase):
             result = refine_small_regions(crop, ordinary + [number], ProcessingConfig(provider="gpt"), [4], [1])
         self.assertEqual(request.call_count, 4)
         self.assertTrue(any(r["text"] == "22106649亿5999万9075" for r in result))
+        self.assertEqual(len(request.call_args.args[2]), 4)
+        self.assertIn("20% overlap", request.call_args.args[1])

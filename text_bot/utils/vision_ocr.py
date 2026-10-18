@@ -156,7 +156,27 @@ def refine_small_regions(crop, regions, config, budget=None, numeric_reserve=Non
         try:
             prompt = transcription_prompt(focused, config.ocr_scope)
             prompt += "\nThis is a magnified source region. Read tiny status/UI text row by row. One row per record. Copy visible glyphs only; do not guess illegible letters. Check long numbers digit by digit against THIS image; never reuse a number from previous messages."
-            improved = parse_regions(complete_external(config.provider, prompt, [(focused.data, focused.name)], config=config, max_attempts=1))
+            views = [(focused.data, focused.name)]
+            if numeric_ui:
+                # Long, slanted number rows need more local detail than a wide
+                # screenshot. These are overlapping views of the same pixels,
+                # never an expected answer or another OCR engine's text.
+                for suffix, detail in (
+                    ("left", focus.crop((0, 0, round(focus.width * .6), focus.height))),
+                    ("right", focus.crop((round(focus.width * .4), 0, focus.width, focus.height))),
+                    ("rotated", focus.rotate(-10, expand=True, fillcolor="white")),
+                ):
+                    if suffix != "rotated":
+                        ratio = min(2, 1800 / detail.width, 2200 / detail.height)
+                        if ratio > 1:
+                            detail = detail.resize((round(detail.width * ratio), round(detail.height * ratio)), Image.Resampling.LANCZOS)
+                    buffer = io.BytesIO()
+                    detail.save(buffer, format="PNG")
+                    views.append((buffer.getvalue(), focused.name + "." + suffix + ".png"))
+                prompt = prompt.replace("Only the ONE image attached to THIS message is the source of truth.",
+                    "The attachments are multiple views of ONE source region: full, left 60%, right 60% (20% overlap), and a rotated view. They show the SAME text, not separate panels.")
+                prompt += "\nReconstruct the source ONCE. Use the overlapping enlarged halves to distinguish each individual digit, including the last digits. Do not duplicate their overlap. Return coordinates relative to the FIRST, FULL image only."
+            improved = parse_regions(complete_external(config.provider, prompt, views, config=config, max_attempts=1))
             if not improved or all(r.get("illegible") for r in improved):
                 result.append(item)
                 continue
