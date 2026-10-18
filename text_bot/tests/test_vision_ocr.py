@@ -69,10 +69,19 @@ class VisionTests(unittest.TestCase):
         crop = make_crops(sample(1000), "test.png")[0]
         ordinary = [{**region("Long UI: " + "A" * 200, [0, 100 * i, 900, 100 * i + 80]), "kind": "ui"} for i in range(4)]
         number = {**region("异能量：221066491亿5999万9015", [0, 800, 900, 900]), "kind": "ui"}
-        raw = json.dumps({"regions": [region("22106649亿5999万9075", [0, 0, 900, 900])]})
+        raw = json.dumps({"regions": [region("22106649亿5999万9015", [0, 0, 900, 900])]})
         with patch("utils.vision_ocr.complete_external", return_value=raw) as request:
             result = refine_small_regions(crop, ordinary + [number], ProcessingConfig(provider="gpt"), [4], [1])
         self.assertEqual(request.call_count, 4)
-        self.assertTrue(any(r["text"] == "22106649亿5999万9075" for r in result))
-        self.assertEqual(len(request.call_args.args[2]), 4)
+        self.assertTrue(any(r["text"] == "22106649亿5999万9015" for r in result))
+        self.assertEqual(len(request.call_args.args[2]), 5)
         self.assertIn("20% overlap", request.call_args.args[1])
+
+    def test_standalone_long_number_is_refined_even_when_classified_as_caption(self):
+        crop = make_crops(sample(1000), "test.png")[0]
+        item = {**region("123456789012", [100, 100, 900, 300]), "kind": "caption"}
+        raw = json.dumps({"regions": [region("123456789012", [100, 100, 900, 300])]})
+        with patch("utils.vision_ocr.complete_external", return_value=raw) as request:
+            refine_small_regions(crop, [item], ProcessingConfig(provider="gpt"), [1], [1])
+        request.assert_called_once()
+        self.assertEqual(len(request.call_args.args[2]), 5)

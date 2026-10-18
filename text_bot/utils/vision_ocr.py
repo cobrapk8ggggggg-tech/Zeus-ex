@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
-from PIL import Image, ImageStat
+from PIL import Image, ImageStat, ImageOps
 
 from utils.providers import complete_external
 
@@ -134,7 +134,9 @@ def refine_small_regions(crop, regions, config, budget=None, numeric_reserve=Non
     budget = budget if budget is not None else [4]
     numeric_reserve = numeric_reserve if numeric_reserve is not None else [0]
     for item in regions:
-        numeric_ui = (item.get("kind") == "ui" or ":" in item["text"] or "：" in item["text"]) and bool(re.search(r"\d[\d,.亿万]{5,}", item["text"]))
+        # Models sometimes classify a standalone number as a caption/speech
+        # while its label is a separate UI record. Its digits still need care.
+        numeric_ui = bool(re.search(r"\d[\d,.亿万]{5,}", item["text"]))
         dense_ui = len(item["text"]) > 180 and (item.get("kind") == "ui" or item["text"].count(":") >= 4)
         difficult = item.get("illegible") or (config.ocr_double_check and (dense_ui or numeric_ui))
         if not difficult or budget[0] <= 0 or (not numeric_ui and budget[0] <= numeric_reserve[0]):
@@ -177,9 +179,16 @@ def refine_small_regions(crop, regions, config, budget=None, numeric_reserve=Non
                     buffer = io.BytesIO()
                     detail.save(buffer, format="PNG")
                     views.append((buffer.getvalue(), focused.name + "." + suffix + ".png"))
+                contrast = focus.convert("L").point(lambda value: 255 if value >= 190 else 0)
+                if ImageStat.Stat(contrast).mean[0] < 127:
+                    contrast = ImageOps.invert(contrast)
+                buffer = io.BytesIO()
+                contrast.save(buffer, format="PNG")
+                views.append((buffer.getvalue(), focused.name + ".contrast.png"))
                 prompt = prompt.replace("Only the ONE image attached to THIS message is the source of truth.",
-                    "The attachments are multiple views of ONE source region: full, left 60%, right 60% (20% overlap), and a rotated view. They show the SAME text, not separate panels.")
+                    "The attachments are multiple views of ONE source region: full, left 60%, right 60% (20% overlap), rotated, and contrast-only. They show the SAME text, not separate panels.")
                 prompt += "\nReconstruct the source ONCE. Use the overlapping enlarged halves to distinguish each individual digit, including the last digits. Do not duplicate their overlap. Return coordinates relative to the FIRST, FULL image only."
+                prompt += " Distinguish printed glyphs from illustration, garment seams, borders and background lines; these are not extra digits. Contrast may erase faint strokes, so confirm them against the original full view."
             improved = parse_regions(complete_external(config.provider, prompt, views, config=config, max_attempts=1))
             if not improved or all(r.get("illegible") for r in improved):
                 result.append(item)

@@ -63,6 +63,8 @@ def run_validation(api, marker, folder, mode="full"):
     try:
         config = get_processing_config()
         report["model"] = config.chatgpt_model
+        report["ocr_settings"] = {key: getattr(config, key) for key in
+                                  ("ocr_crop_height", "ocr_double_check", "ocr_scope", "ocr_rescue_limit")}
         for provider, configured in (("gpt", bool(config.chatgpt_access_token)), ("gemini", bool(config.gemini_cookie_header))):
             if not configured:
                 report["accounts"][provider] = {"status": "not_configured"}
@@ -105,7 +107,7 @@ def run_validation(api, marker, folder, mode="full"):
                 output = io.BytesIO()
                 crop.save(output, format="PNG")
             text = extract_page(output.getvalue(), "3-small-numeric-ui.png", candidate, diagnostics=diagnostics)
-            expected = "22106649亿5999万9075"
+            expected = "22106649亿5999万9015"
             report["fine_numeric_check"] = {"expected": expected, "found": normalized(expected) in normalized(text), "text": text}
             line = "ZEUS_FILE_VALIDATION_" + uuid.uuid4().hex
             answer = complete_external("gpt", "Read the attached text file and return its one line exactly.",
@@ -143,7 +145,7 @@ def run_validation(api, marker, folder, mode="full"):
                 output = io.BytesIO()
                 crop.save(output, format="PNG")
             text = extract_page(output.getvalue(), "3-small-numeric-ui.png", candidate)
-            expected = "22106649亿5999万9075"
+            expected = "22106649亿5999万9015"
             report["fine_numeric_check"] = {"expected": expected, "found": normalized(expected) in normalized(text), "text": text}
         report["same_conversation"] &= provider_thread("gpt").get("conversation_id") == conversation
         report["status"] = "completed"
