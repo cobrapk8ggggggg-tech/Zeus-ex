@@ -202,7 +202,13 @@ def inspect_account(provider, action, config):
         if provider == "gpt":
             if action == "account":
                 info = token_details(config)
-                info["available_models"] = len(client.models())
+                try:
+                    info["available_models"] = len(client.models())
+                    info["model_list_available"] = True
+                except RuntimeError as exc:
+                    info["available_models"] = 0
+                    info["model_list_available"] = False
+                    info["model_list_error"] = str(exc)
                 return info
             return getattr(client, action)()
         if action == "account":
@@ -218,7 +224,20 @@ def _check_response(response):
     # Never pass response bodies or request headers (which can contain sessions)
     # into Discord errors or logs.
     if not response.ok:
-        raise RuntimeError(f"فشل الاتصال بمحرك المعالجة (HTTP {response.status_code}).")
+        # Expose validation field names, never request inputs/header values.
+        validation = []
+        if response.status_code == 422:
+            try:
+                detail = response.json().get("detail")
+                if isinstance(detail, list):
+                    for item in detail[:5]:
+                        if isinstance(item, dict):
+                            validation.append({"loc": item.get("loc"), "type": item.get("type")})
+            except (ValueError, AttributeError, TypeError):
+                pass
+        suffix = " " + json.dumps(validation) if validation else ""
+        error = ProviderConfigurationError if response.status_code == 422 else RuntimeError
+        raise error(f"فشل الاتصال بمحرك المعالجة (HTTP {response.status_code})." + suffix)
 
 
 def _image_info(data, name):

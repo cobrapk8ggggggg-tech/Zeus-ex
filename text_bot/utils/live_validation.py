@@ -56,8 +56,14 @@ def run_validation(api, marker, folder):
                 account = inspect_account(provider, "account", candidate)
                 summary = {"status": "connected", "models": account.get("available_models", 1)}
                 if provider == "gpt":
-                    summary["projects"] = len(inspect_account(provider, "projects", candidate))
-                    summary["chats"] = len(inspect_account(provider, "chats", candidate))
+                    summary["model_list_available"] = account.get("model_list_available")
+                    if account.get("model_list_error"):
+                        summary["model_list_error"] = account["model_list_error"]
+                    for action in ("projects", "chats"):
+                        try:
+                            summary[action] = len(inspect_account(provider, action, candidate))
+                        except Exception as exc:
+                            summary[action + "_error"] = api.sanitize_error(exc)
                 report["accounts"][provider] = summary
             except Exception as exc:
                 report["accounts"][provider] = {"status": "failed", "error": api.sanitize_error(exc)}
@@ -92,6 +98,9 @@ def run_validation(api, marker, folder):
     except Exception as exc:
         report["status"] = "failed"
         report["error"] = api.sanitize_error(exc)
+        cause = exc.__cause__
+        if cause is not None and "HTTP " in str(cause):
+            report["server_error"] = api.sanitize_error(cause)
     finally:
         report["finished_at"] = int(time.time())
         collection.update_one({"_id": marker}, {"$set": {k: v for k, v in report.items() if k != "_id"}})

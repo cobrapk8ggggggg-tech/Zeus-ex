@@ -99,13 +99,13 @@ class RecordPicker(discord.ui.View):
 
 class TextModal(discord.ui.Modal):
     def __init__(self, console, action):
-        titles = {"token": "تحديث جلسة GPT", "message": "رسالة في المحادثة المختارة", "open_chat": "اختيار محادثة GPT برابط", "quality": "جودة استخراج الصور"}
+        titles = {"token": "تحديث جلسة GPT", "message": "رسالة في المحادثة المختارة", "open_chat": "اختيار محادثة GPT برابط", "quality": "جودة استخراج الصور", "model": "تحديد نموذج GPT"}
         super().__init__(title=titles[action])
         self.console, self.action = console, action
         if action == "quality":
             self.value = discord.ui.TextInput(label="ارتفاع المقطع بالبكسل (900–2400)", default=str(console.config.ocr_crop_height))
         else:
-            self.value = discord.ui.TextInput(label={"token": "Access token لحساب ChatGPT", "message": "نص الرسالة", "open_chat": "رابط المحادثة أو المعرّف"}[action],
+            self.value = discord.ui.TextInput(label={"token": "Access token لحساب ChatGPT", "message": "نص الرسالة", "open_chat": "رابط المحادثة أو المعرّف", "model": "معرّف النموذج أو auto"}[action],
                                              style=discord.TextStyle.paragraph, max_length=4000)
         self.add_item(self.value)
 
@@ -129,6 +129,10 @@ class TextModal(discord.ui.Modal):
                 await asyncio.to_thread(save_processing_config, chatgpt_access_token=value)
                 if old and old["account_id"] != details["account_id"]:
                     await asyncio.to_thread(new_thread, "gpt", ordinary=True)
+            elif self.action == "model":
+                if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value):
+                    raise ValueError()
+                await asyncio.to_thread(save_processing_config, chatgpt_model=value)
             elif self.action == "quality":
                 height = int(value)
                 if not 900 <= height <= 2400:
@@ -211,7 +215,7 @@ class ProviderConsole(discord.ui.LayoutView):
                           f"المعرّف: `{safe(cid)}`\nالمرفقات الجاهزة للرسالة التالية: `{len(_PENDING[self.provider])}`\n-# كل الصور والأجزاء تتابع هذه المحادثة. لا تتغير تلقائيًا ولا تُحذف بعد الاستخراج.")
             if self.provider == "gpt":
                 actions = [("معلومات الحساب والتوكن", "account", "infocircle"), ("تحديث التوكن", "token", "lock"),
-                           ("نماذج الحساب", "models", "adjustments"), ("مشاريع الحساب", "projects", "folderopen"),
+                           ("نماذج الحساب", "models", "adjustments"), ("تحديد نموذج يدويًا", "model", "adjustments"), ("مشاريع الحساب", "projects", "folderopen"),
                            ("اختيار محادثة", "chats", "message"), ("فتح برابط", "open_chat", "bookmark")]
             else:
                 self.text(box, "-# النموذج adaptive وحساب Google رقم 1 هما المثبتان في الملف المرفق. قائمة المحادثات هنا تعرض ما حُفظ بهذا البوت أو استوردته بملف حالة.")
@@ -254,7 +258,7 @@ class ProviderConsole(discord.ui.LayoutView):
     async def action(self, interaction, action):
         if not await guard(self.api, interaction):
             return
-        if action in ("token", "message", "open_chat", "quality"):
+        if action in ("token", "message", "open_chat", "quality", "model"):
             await interaction.response.send_modal(TextModal(self, action))
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -295,7 +299,8 @@ class ProviderConsole(discord.ui.LayoutView):
                         body = (f"الحساب: `{safe(records['account_id'])}`\nالبريد: {safe(records.get('email'))}\n"
                                 f"الخطة: **{safe(records.get('plan'))}**\nالمستخدم: `{safe(records.get('user_id'))}`\n"
                                 f"إصدار التوكن: {stamp(records.get('issued_at'))}\nانتهاؤه: {stamp(records.get('expires_at'))}\n"
-                                f"النماذج المتاحة: `{records['available_models']}`\nتم التحقق من الاتصال، ولا يتم عرض التوكن نفسه.")
+                                f"النماذج المتاحة: `{records['available_models']}`\n"
+                                f"قائمة النماذج: {'متصلة' if records.get('model_list_available') else 'تعذر جلبها؛ يمكن تحديد نموذج يدويًا'}\nلا يتم عرض التوكن نفسه.")
                     else:
                         body = "جلسة Google متصلة • الحساب `/u/1` • النموذج `adaptive`\nمعرّفات المحادثة محفوظة، والكوكيز لا تُعرض."
                     await interaction.followup.send(embed=self.api.themed_embed("معلومات الحساب الخاصة", body), ephemeral=True)
