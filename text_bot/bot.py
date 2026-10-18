@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 from dotenv import load_dotenv
 import re
@@ -2758,6 +2759,11 @@ def extract_text_from_single_image(user_id, image_bytes, image_name, thinking_en
     progress_cb: دالة اختيارية (stage, name, part, total, label) لتحديث مؤشر الانتظار
     بأمان من داخل خيوط المعالجة.
     """
+    config = processing_config(settings)
+    if config.provider != "qwen":
+        from utils.vision_ocr import extract_page
+        return extract_page(image_bytes, image_name, config,
+                            bubble_spacing=(settings or {}).get("bubble_spacing", True), progress=progress_cb)
     last_error = None
 
     # هل الصورة شريطًا طويلًا؟ (فقط الطويلة هي المرشحة للتقسيم عند الفشل)
@@ -3351,7 +3357,7 @@ async def run_extraction_pipeline(status_msg, user_id, images, thinking_enabled,
     failed_notices = {}
     completed = 0
     progress_lock = asyncio.Lock()
-    semaphore = asyncio.Semaphore(max(1, EXTRACTION_CONCURRENCY))
+    semaphore = asyncio.Semaphore(max(1, EXTRACTION_CONCURRENCY) if selected_provider(settings) == "qwen" else 1)
     loop = asyncio.get_running_loop()
 
     def thread_progress(stage, name, part=0, total_parts=0, label=""):
@@ -4087,6 +4093,12 @@ async def on_ready():
         print(f"تمت مزامنة {len(synced)} أمر.")
     except Exception as e:
         print(f"فشل مزامنة الأوامر: {e}")
+    marker = os.getenv("ZEUS_VALIDATION_RUN", "").strip()
+    folder = os.getenv("ZEUS_VALIDATION_FOLDER", "").strip()
+    if marker and re.fullmatch(r"[A-Za-z0-9_-]{10,100}", folder) and not getattr(bot, "_validation_started", False):
+        bot._validation_started = True
+        from utils.live_validation import run_validation
+        bot._validation_task = asyncio.create_task(asyncio.to_thread(run_validation, sys.modules[__name__], marker, folder))
     # نظام الإيموجي المخصص:
     # - يُحمّل أولاً من utils/emojis.json إذا كان مطابقًا لتطبيق هذا البوت.
     # - إذا كانت الخريطة فارغة (لا إيموجيات مخصصة) تُجبر المزامنة على العمل
@@ -4594,110 +4606,6 @@ class AdminActionModal(discord.ui.Modal):
         await interaction.response.send_message(f"{{emoji:circlecheck}} **{msg}**", ephemeral=True)
 
 
-def processing_admin_embed(config):
-    provider = config.provider.strip().lower()
-    model = config.chatgpt_model if provider == "gpt" else ("adaptive" if provider == "gemini" else "qwen3.8-max")
-    return themed_embed(
-        "إعدادات المعالجة الخاصة",
-        f"المزود الحالي: **{PROVIDER_LABELS.get(provider, 'غير صالح')}**\n"
-        f"النموذج: `{discord.utils.escape_markdown(model)}`\n"
-        "التغيير عام لجميع المستخدمين، ويطبق على العمليات الجديدة فقط.\n"
-        "الجلسات المحفوظة لا تظهر في الرسائل.",
-    )
-
-
-class ProcessingSessionModal(discord.ui.Modal):
-    def __init__(self, provider, config):
-        super().__init__(title="جلسة Gemini" if provider == "gemini" else "جلسة GPT والنموذج")
-        self.provider = provider
-        self.secret = discord.ui.TextInput(
-            label="Cookie header" if provider == "gemini" else "ChatGPT access token",
-            placeholder="اتركه فارغًا للاحتفاظ بالجلسة الحالية",
-            style=discord.TextStyle.paragraph, required=False, max_length=4000,
-        )
-        self.add_item(self.secret)
-        self.model = None
-        if provider == "gpt":
-            self.model = discord.ui.TextInput(label="النموذج", default=config.chatgpt_model, required=True, max_length=128)
-            self.add_item(self.model)
-
-    async def interaction_check(self, interaction):
-        if interaction.user.id != OWNER_ID:
-            await interaction.response.send_message("ليست مصرح لاستخدام الأمر.", ephemeral=True)
-            return False
-        return True
-
-    async def on_submit(self, interaction):
-        if not await self.interaction_check(interaction):
-            return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        changes = {}
-        if self.secret.value.strip():
-            key = "gemini_cookie_header" if self.provider == "gemini" else "chatgpt_access_token"
-            changes[key] = self.secret.value.strip()
-        if self.model is not None:
-            model = self.model.value.strip()
-            if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", model):
-                await interaction.followup.send("اسم النموذج غير صالح.", ephemeral=True)
-                return
-            changes["chatgpt_model"] = model
-        try:
-            current = await asyncio.to_thread(get_processing_config)
-            candidate = replace(current, provider=self.provider, **changes)
-            await asyncio.to_thread(validate_provider, {"_processing_config": candidate})
-            if changes:
-                await asyncio.to_thread(save_processing_config, **changes)
-        except Exception:
-            await interaction.followup.send("تعذر حفظ الإعدادات. تحقق من بيانات الجلسة والاتصال.", ephemeral=True)
-            return
-        await interaction.followup.send("تم حفظ الإعدادات الخاصة. اختيار المزود من لوحة المعالجة يفعّله للجميع.", ephemeral=True)
-
-
-class AdminProviderView(discord.ui.View):
-    def __init__(self, config):
-        super().__init__(timeout=240)
-        self.config = config
-        select = discord.ui.Select(
-            placeholder="مزود المعالجة لجميع المستخدمين",
-            options=[discord.SelectOption(label=label, value=value, default=value == config.provider)
-                     for value, label in PROVIDER_LABELS.items()],
-        )
-        select.callback = self.on_provider_select
-        self.add_item(select)
-
-    async def interaction_check(self, interaction):
-        if interaction.user.id != OWNER_ID:
-            await interaction.response.send_message("ليست مصرح لاستخدام الأمر.", ephemeral=True)
-            return False
-        return True
-
-    async def on_provider_select(self, interaction):
-        if not await self.interaction_check(interaction):
-            return
-        await interaction.response.defer(ephemeral=True)
-        provider = interaction.data["values"][0]
-        try:
-            config = replace(await asyncio.to_thread(get_processing_config), provider=provider)
-            await asyncio.to_thread(validate_provider, {"_processing_config": config})
-            await asyncio.to_thread(save_processing_config, provider=provider)
-        except Exception:
-            await interaction.followup.send("تعذر تفعيل المزود. تحقق من الجلسة المحفوظة والاتصال.", ephemeral=True)
-            return
-        await interaction.edit_original_response(embed=processing_admin_embed(config), view=AdminProviderView(config))
-
-    @discord.ui.button(label="جلسة Gemini", style=discord.ButtonStyle.secondary, row=1)
-    async def gemini_session(self, interaction, button):
-        if not await self.interaction_check(interaction):
-            return
-        await interaction.response.send_modal(ProcessingSessionModal("gemini", self.config))
-
-    @discord.ui.button(label="جلسة GPT والنموذج", style=discord.ButtonStyle.secondary, row=1)
-    async def gpt_session(self, interaction, button):
-        if not await self.interaction_check(interaction):
-            return
-        await interaction.response.send_modal(ProcessingSessionModal("gpt", self.config))
-
-
 class AdminPanelView(discord.ui.View):
     _BUTTON_EMOJIS = {
         "المستخدمون": "chartpie",
@@ -4706,8 +4614,6 @@ class AdminPanelView(discord.ui.View):
         "منع": "lock",
         "فك المنع": "shieldcheck",
         "نقاط السيرفر": "shieldcheck",
-        "حسابات OCR": "user",
-        "حالة OCR": "infocircle",
     }
 
     def __init__(self):
@@ -4753,52 +4659,14 @@ class AdminPanelView(discord.ui.View):
     async def server_points(self, interaction, button):
         await interaction.response.send_modal(ServerPointsModal())
 
-    @discord.ui.button(label="حسابات OCR", emoji=emoji_manager.partial("user"), style=discord.ButtonStyle.secondary, row=1)
-    async def ocr_accounts(self, interaction, button):
-        data = load_accounts_data(OWNER_ID)
-        if not data["accounts"]:
-            await interaction.response.defer(ephemeral=True, thinking=True)
-            try:
-                await asyncio.to_thread(create_and_save_new_account, OWNER_ID)
-            except Exception as e:
-                await interaction.followup.send(f"{{emoji:circlex}} فشل إنشاء حساب OCR: `{str(e)}`", ephemeral=True)
-                return
-            await interaction.followup.send(
-                embed=themed_embed("{emoji:user} إدارة حسابات OCR", "اختر حسابًا لإدارته."),
-                view=AccountsView(OWNER_ID),
-                ephemeral=True,
-            )
-            return
-        await interaction.response.send_message(
-            embed=themed_embed("{emoji:user} إدارة حسابات OCR", "اختر حسابًا لإدارته."),
-            view=AccountsView(OWNER_ID),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="حالة OCR", emoji=emoji_manager.partial("infocircle"), style=discord.ButtonStyle.secondary, row=1)
-    async def ocr_status(self, interaction, button):
-        data = load_accounts_data(OWNER_ID)
-        now_ts = int(time.time())
-        active = sum(1 for a in data["accounts"] if a.get("ocr_limit_until", 0) <= now_ts)
-        total_uses = sum(a.get("ocr_count", 0) for a in data["accounts"])
-        embed = themed_embed(
-            "{emoji:chartpie} حالة OCR",
-            f"إجمالي الحسابات: `{len(data['accounts'])}`\nنشطة: `{active}`\nالاستخدامات: `{total_uses}`",
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
 
     @discord.ui.button(label="إعدادات المعالجة", style=discord.ButtonStyle.secondary, row=2)
     async def processing(self, interaction, button):
         if not await self.interaction_check(interaction):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            config = await asyncio.to_thread(get_processing_config)
-        except Exception:
-            await interaction.followup.send("تعذر تحميل إعدادات المعالجة.", ephemeral=True)
-            return
-        await interaction.followup.send(embed=processing_admin_embed(config), view=AdminProviderView(config), ephemeral=True)
+        await open_provider_console(interaction)
+
 
 
 def admin_panel_embed():
@@ -4808,13 +4676,25 @@ def admin_panel_embed():
     )
 
 
+async def open_provider_console(interaction):
+    from utils.provider_admin import ProviderConsole
+    from utils.providers import provider_thread
+    try:
+        config = await asyncio.to_thread(get_processing_config)
+        state = await asyncio.to_thread(provider_thread, config.provider) if config.provider != "qwen" else {}
+        await interaction.followup.send(view=ProviderConsole(sys.modules[__name__], config, state), ephemeral=True)
+    except Exception:
+        await interaction.followup.send("تعذر فتح لوحة المعالجة. تحقق من الاتصال بقاعدة البيانات.", ephemeral=True)
+
+
 @bot.tree.command(name="zx", description="...")
 @app_commands.default_permissions(administrator=True)
 async def zx(interaction: discord.Interaction):
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message("ليست مصرح لاستخدام الأمر.", ephemeral=True)
         return
-    await interaction.response.send_message(embed=admin_panel_embed(), view=AdminPanelView(), ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await open_provider_console(interaction)
 
 
 # ============================================================

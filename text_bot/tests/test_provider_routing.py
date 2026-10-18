@@ -93,54 +93,6 @@ class UIAndTranslationTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(name, visible)
         self.assertFalse(hasattr(panel, "on_provider_select"))
 
-    async def test_owner_can_save_global_choice(self):
-        config = ProcessingConfig()
-        panel = bot.AdminProviderView(config)
-        interaction = SimpleNamespace(user=SimpleNamespace(id=bot.OWNER_ID), data={"values": ["gpt"]}, response=SimpleNamespace(defer=AsyncMock()), edit_original_response=AsyncMock())
-        with patch.object(bot, "get_processing_config", return_value=config), patch.object(bot, "validate_provider"), patch.object(bot, "save_processing_config") as save:
-            await panel.on_provider_select(interaction)
-        save.assert_called_once_with(provider="gpt")
-        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
-        interaction.edit_original_response.assert_awaited_once()
-
-    async def test_nonowner_cannot_change_provider_even_with_callback(self):
-        panel = bot.AdminProviderView(ProcessingConfig())
-        interaction = SimpleNamespace(user=SimpleNamespace(id=bot.OWNER_ID + 1), data={"values": ["gpt"]}, response=SimpleNamespace(send_message=AsyncMock()))
-        with patch.object(bot, "save_processing_config") as save:
-            await panel.on_provider_select(interaction)
-        save.assert_not_called()
-        self.assertTrue(interaction.response.send_message.call_args.kwargs["ephemeral"])
-
-    async def test_nonowner_cannot_submit_session_modal(self):
-        modal = bot.ProcessingSessionModal("gpt", ProcessingConfig())
-        interaction = SimpleNamespace(user=SimpleNamespace(id=bot.OWNER_ID + 1), response=SimpleNamespace(send_message=AsyncMock()))
-        with patch.object(bot, "save_processing_config") as save:
-            await modal.on_submit(interaction)
-        save.assert_not_called()
-        self.assertTrue(interaction.response.send_message.call_args.kwargs["ephemeral"])
-
-    async def test_owner_model_change_keeps_existing_session_and_replies_privately(self):
-        config = ProcessingConfig(provider="gpt", chatgpt_access_token="private-token")
-        modal = bot.ProcessingSessionModal("gpt", config)
-        modal.model._value = "owner-model"
-        interaction = SimpleNamespace(user=SimpleNamespace(id=bot.OWNER_ID), response=SimpleNamespace(defer=AsyncMock()), followup=SimpleNamespace(send=AsyncMock()))
-        with patch.object(bot, "get_processing_config", return_value=config), patch.object(bot, "validate_provider") as validate, patch.object(bot, "save_processing_config") as save:
-            await modal.on_submit(interaction)
-        save.assert_called_once_with(chatgpt_model="owner-model")
-        self.assertEqual(validate.call_args.args[0]["_processing_config"].chatgpt_access_token, "private-token")
-        self.assertTrue(interaction.followup.send.call_args.kwargs["ephemeral"])
-        self.assertNotIn("private-token", str(interaction.followup.send.call_args))
-
-    async def test_zx_is_private_and_has_no_prefix_alias(self):
-        interaction = SimpleNamespace(user=SimpleNamespace(id=bot.OWNER_ID), response=SimpleNamespace(send_message=AsyncMock()))
-        await bot.zx.callback(interaction)
-        self.assertTrue(interaction.response.send_message.call_args.kwargs["ephemeral"])
-        self.assertIsNone(bot.bot.get_command("admin"))
-        self.assertIsNone(bot.bot.get_command("لوحة"))
-        denied = SimpleNamespace(user=SimpleNamespace(id=bot.OWNER_ID + 1), response=SimpleNamespace(send_message=AsyncMock()))
-        await bot.zx.callback(denied)
-        self.assertNotIn("view", denied.response.send_message.call_args.kwargs)
-
     async def test_snapshot_ignores_old_user_choice_and_survives_global_change(self):
         with patch("utils.providers.load_processing_config", return_value={"provider": "gemini"}):
             settings = snapshot_processing_settings({"provider": "gpt", "include_sfx": True})

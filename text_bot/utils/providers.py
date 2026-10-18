@@ -2,8 +2,8 @@
 
 Gemini: gemini_complete.py (StreamGenerate + bard-storage).
 GPT: chatgpt_android_interactive.py (Android backend + file upload).
-Each completion owns its session and starts a new conversation, so parallel
-pages and different Discord users never share conversation state.
+HTTP sessions are request-local; the owner-selected server conversations are
+durable in MongoDB. Requests to each conversation are serialized.
 """
 
 import base64
@@ -14,15 +14,20 @@ import random
 import re
 import time
 import uuid
+import threading
+import mimetypes
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import requests
 from PIL import Image
-from utils.storage import load_processing_config
+from utils.storage import (load_processing_config, load_provider_thread, save_provider_thread,
+                           select_provider_thread, list_provider_threads)
 
 
 PROVIDER_LABELS = {"qwen": "Qwen", "gemini": "Gemini", "gpt": "GPT"}
+PROVIDER_LOCKS = {name: threading.RLock() for name in ("gemini", "gpt")}
 
 
 class ProviderConfigurationError(RuntimeError):
@@ -35,6 +40,9 @@ class ProcessingConfig:
     chatgpt_model: str = "auto"
     gemini_cookie_header: str = field(default="", repr=False)
     chatgpt_access_token: str = field(default="", repr=False)
+    ocr_crop_height: int = 1700
+    ocr_double_check: bool = True
+    ocr_scope: str = "all"
 
 
 def get_processing_config():
@@ -44,6 +52,9 @@ def get_processing_config():
         chatgpt_model=saved.get("chatgpt_model") or os.getenv("CHATGPT_MODEL", "auto"),
         gemini_cookie_header=saved.get("gemini_cookie_header") or os.getenv("GEMINI_COOKIE_HEADER", ""),
         chatgpt_access_token=saved.get("chatgpt_access_token") or os.getenv("CHATGPT_ACCESS_TOKEN", ""),
+        ocr_crop_height=max(900, min(2400, int(saved.get("ocr_crop_height", 1700)))),
+        ocr_double_check=bool(saved.get("ocr_double_check", True)),
+        ocr_scope=saved.get("ocr_scope", "all"),
     )
 
 
@@ -79,6 +90,68 @@ def _gemini_cookies(config=None):
     return value
 
 
+def parse_cookie_file(data):
+    """Accept Cookie headers, exported cookie JSON, and Netscape cookie files."""
+    if len(data) > 2 * 1024 * 1024:
+        raise ProviderConfigurationError("ملف الكوكيز أكبر من الحد المسموح (2 MB).")
+    try:
+        text = data.decode("utf-8-sig").strip()
+    except UnicodeError:
+        raise ProviderConfigurationError("ارفع ملف كوكيز نصيًا بترميز UTF-8.") from None
+    pairs = []
+    if text.startswith(("[", "{")):
+        try:
+            content = json.loads(text)
+            if isinstance(content, dict):
+                content = content.get("cookies", [{"name": k, "value": v} for k, v in content.items()])
+            for cookie in content:
+                domain = str(cookie.get("domain", "google.com")).lstrip(".")
+                if domain == "google.com" or domain.endswith(".google.com"):
+                    pairs.append((cookie["name"], cookie["value"]))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise ProviderConfigurationError("بنية ملف كوكيز JSON غير صالحة.") from None
+    elif "\t" in text:
+        for line in text.splitlines():
+            if line.startswith("#HttpOnly_"):
+                line = line[len("#HttpOnly_"):]
+            elif not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7 and (parts[0].lstrip(".") == "google.com" or parts[0].endswith(".google.com")):
+                pairs.append((parts[5], parts[6]))
+    else:
+        if text.startswith("export "):
+            try:
+                tokens = shlex.split(text)
+                text = next(item.split("=", 1)[1] for item in tokens if item.startswith(("BROWSER_COOKIE_HEADER=", "GEMINI_COOKIE_HEADER=")))
+            except (ValueError, StopIteration):
+                raise ProviderConfigurationError("ملف ترويسة الكوكيز غير صالح.") from None
+        text = re.sub(r"^cookie\s*:\s*", "", text, flags=re.I)
+        for part in text.replace("\r", "").replace("\n", ";").split(";"):
+            if "=" in part:
+                pairs.append(tuple(part.strip().split("=", 1)))
+    cleaned = {}
+    for key, value in pairs:
+        key, value = str(key).strip(), str(value).strip()
+        if not key or re.search(r"[\s;=\r\n]", key) or re.search(r"[;\r\n]", value):
+            raise ProviderConfigurationError("يحتوي ملف الكوكيز قيما غير صالحة.")
+        cleaned[key] = value
+    if not cleaned:
+        raise ProviderConfigurationError("لم يعثر على كوكيز Google صالحة في الملف.")
+    return "; ".join(k + "=" + v for k, v in cleaned.items())
+
+
+def token_details(config):
+    token, account = _chatgpt_credentials(config)
+    encoded = token.split(".")[1]
+    claims = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    auth = claims.get("https://api.openai.com/auth", {})
+    profile = claims.get("https://api.openai.com/profile", {})
+    return {"account_id": account, "email": claims.get("email") or profile.get("email"),
+            "plan": auth.get("chatgpt_plan_type"), "user_id": auth.get("chatgpt_user_id") or claims.get("sub"),
+            "issued_at": claims.get("iat"), "expires_at": claims.get("exp")}
+
+
 def _chatgpt_credentials(config=None):
     token = (config.chatgpt_access_token if config else os.getenv("CHATGPT_ACCESS_TOKEN", "")).strip()
     if not token:
@@ -104,6 +177,41 @@ def validate_provider(settings=None):
     elif provider == "gpt":
         _chatgpt_credentials(config)
     return provider
+
+
+def provider_thread(provider):
+    return load_provider_thread(provider).get("state") or {}
+
+
+def choose_thread(provider, state):
+    with PROVIDER_LOCKS[provider]:
+        select_provider_thread(provider, state)
+
+
+def new_thread(provider, *, ordinary=False):
+    with PROVIDER_LOCKS[provider]:
+        old = provider_thread(provider)
+        state = {k: old[k] for k in ("gizmo_id", "project_name") if k in old} if provider == "gpt" and not ordinary else {}
+        state["title"] = "محادثة جديدة"
+        select_provider_thread(provider, state)
+
+
+def inspect_account(provider, action, config):
+    client = ChatGPTClient(config) if provider == "gpt" else GeminiClient(config)
+    try:
+        if provider == "gpt":
+            if action == "account":
+                info = token_details(config)
+                info["available_models"] = len(client.models())
+                return info
+            return getattr(client, action)()
+        if action == "account":
+            return client.connection_status()
+        if action == "chats":
+            return list_provider_threads(provider)
+        raise ProviderConfigurationError("هذه الوظيفة غير متاحة في بروتوكول الجلسة المرفق.")
+    finally:
+        client.session.close()
 
 
 def _check_response(response):
@@ -134,6 +242,7 @@ class GeminiClient:
     UPLOAD_AUTH = "Basic c2F2ZXM6cyNMdGhlNmxzd2F2b0RsN3J1d1U="
 
     def __init__(self, config=None):
+        self.state = {}
         self.session = requests.Session()
         self.session.headers.update({
             "accept": "*/*", "accept-language": "en-US,en;q=0.9",
@@ -146,8 +255,8 @@ class GeminiClient:
                 key, value = item.strip().split("=", 1)
                 self.session.cookies.set(key, value, domain=".google.com")
 
-    def upload_image(self, data, name):
-        data, name, mime, _, _ = _image_info(data, name)
+    def upload_file(self, data, name, mime=None):
+        mime = mime or mimetypes.guess_type(name)[0] or "application/octet-stream"
         headers = {
             "X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start",
             "X-Goog-Upload-Header-Content-Length": str(len(data)),
@@ -170,7 +279,18 @@ class GeminiClient:
             raise RuntimeError("لم يصل معرّف الصورة من محرك المعالجة.")
         return [[uri, 1], name]
 
-    def complete(self, prompt, images):
+    def upload_image(self, data, name):
+        data, name, mime, _, _ = _image_info(data, name)
+        return self.upload_file(data, name, mime)
+
+    def connection_status(self):
+        with self.session.get("https://gemini.google.com/u/1/app", timeout=60) as response:
+            _check_response(response)
+            if not re.search(r'"SNlM0e":"(.*?)"', response.text):
+                raise ProviderConfigurationError("جلسة المعالجة تحتاج تحديثًا لدى الإدارة.")
+        return {"connected": True, "account_index": 1, "model": "adaptive"}
+
+    def complete(self, prompt, images, files=()):
         # The attachment uses account /u/1 and the exact same request indices.
         with self.session.get("https://gemini.google.com/u/1/app", timeout=60) as response:
             _check_response(response)
@@ -179,8 +299,12 @@ class GeminiClient:
         if not at or not sid:
             raise ProviderConfigurationError("جلسة المعالجة تحتاج تحديثًا لدى الإدارة.")
         attachments = [self.upload_image(data, name) for data, name in images]
+        attachments.extend(self.upload_file(data, name) for data, name in files)
+        state = self.state
+        context = [state.get("conversation_id", ""), state.get("response_id", ""), state.get("choice_id", ""),
+                   None, None, None, None, None, None, state.get("at_token", "")]
         body = [[prompt, 0, None, attachments, None, None, 0], ["ar"],
-                ["", "", "", None, None, None, None, None, None, ""],
+                context,
                 None, None, None, [], 0, [], [], 1, 0]
         answer = ""
         with self.session.post(
@@ -204,6 +328,14 @@ class GeminiClient:
                 for row in rows:
                     try:
                         payload = json.loads(row[2])
+                        try:
+                            if self.state.get("conversation_id") and payload[1][0] != self.state["conversation_id"]:
+                                raise ProviderConfigurationError("الخادم لم يتابع المحادثة المختارة؛ اختر محادثة صالحة من الإدارة.")
+                            self.state.update({"conversation_id": payload[1][0], "response_id": payload[1][1],
+                                               "choice_id": payload[4][0][0],
+                                               "at_token": payload[3].get("26", "") if isinstance(payload[3], dict) else ""})
+                        except (IndexError, TypeError, KeyError):
+                            pass
                         value = payload[4][0][1][0]
                     except (ValueError, IndexError, TypeError, KeyError):
                         continue
@@ -216,6 +348,7 @@ class ChatGPTClient:
     BASE = "https://android.chat.openai.com"
 
     def __init__(self, config=None):
+        self.state = {}
         token, account = _chatgpt_credentials(config)
         self.model = config.chatgpt_model if config else os.getenv("CHATGPT_MODEL", "auto")
         self.session = requests.Session()
@@ -227,6 +360,52 @@ class ChatGPTClient:
             "oai-device-id": str(uuid.uuid4()), "accept-language": "en-US,en;q=0.9",
             "chatgpt-residency-region": "no_constraint", "x-device-tier": "mid",
         })
+
+    def get(self, path):
+        for attempt in range(5):
+            try:
+                with self.session.get(self.BASE + path, timeout=60) as response:
+                    if response.status_code >= 500 and attempt < 4:
+                        time.sleep(2)
+                        continue
+                    _check_response(response)
+                    return response.json()
+            except requests.RequestException:
+                if attempt == 4:
+                    raise RuntimeError("تعذر الاتصال بالحساب.") from None
+                time.sleep(2)
+
+    def models(self):
+        return self.get("/backend-api/models").get("models", [])
+
+    def chats(self, offset=0):
+        return self.get(f"/backend-api/conversations?offset={offset}&limit=50&order=updated&is_archived=false").get("items", [])
+
+    def projects(self):
+        data = self.get("/backend-api/gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=50&limit=50")
+        result = []
+        for item in data.get("items", []):
+            project = item.get("gizmo", {}).get("gizmo", {})
+            result.append({"id": project.get("id"), "name": project.get("display", {}).get("name", "بدون اسم"),
+                           "chats": item.get("conversations", {}).get("items", [])})
+        return result
+
+    def conversation(self, cid):
+        from urllib.parse import quote
+        return self.get("/backend-api/conversation/" + quote(cid, safe=""))
+
+    def upload_file(self, data, name):
+        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        with self.session.post(self.BASE + "/backend-api/files", json={
+            "file_name": name, "file_size": len(data), "mime_type": mime, "use_case": "multimodal",
+        }, timeout=60) as response:
+            _check_response(response)
+            info = response.json()
+        with requests.put(info["upload_url"], data=data, headers={"x-ms-blob-type": "BlockBlob", "Content-Type": mime}, timeout=180) as response:
+            _check_response(response)
+        with self.session.post(self.BASE + "/backend-api/files/" + info["file_id"] + "/uploaded", json={}, timeout=60) as response:
+            _check_response(response)
+        return {"id": info["file_id"], "name": name, "mime_type": mime, "size": len(data)}
 
     def upload_image(self, data, name):
         data, name, mime, width, height = _image_info(data, name)
@@ -246,25 +425,39 @@ class ChatGPTClient:
                  "size_bytes": len(data), "width": width, "height": height},
                 {"id": info["file_id"], "name": name, "mime_type": mime, "size": len(data)})
 
-    def complete(self, prompt, images):
+    def complete(self, prompt, images, files=()):
         parts, attachments = [], []
         for data, name in images:
             pointer, attachment = self.upload_image(data, name)
             parts.append(pointer)
             attachments.append(attachment)
         parts.append(prompt)
+        attachments.extend(self.upload_file(data, name) for data, name in files)
         message = {
             "id": str(uuid.uuid4()), "author": {"role": "user"},
             "content": {"content_type": "multimodal_text" if images else "text", "parts": parts},
             "status": "finished_successfully", "recipient": "all",
-            "metadata": {"attachments": attachments} if images else {},
+            "metadata": {"attachments": attachments} if attachments else {},
         }
+        cid, gid = self.state.get("conversation_id"), self.state.get("gizmo_id")
+        parent = str(uuid.uuid4())
+        if cid:
+            conversation = self.conversation(cid)
+            parent = conversation.get("current_node")
+            if not parent:
+                raise RuntimeError("المحادثة المحددة لا تحتوي عقدة متابعة صالحة؛ اخترها مجددًا من الإدارة.")
+        if gid:
+            message["metadata"]["gizmo_id"] = gid
         body = {
-            "action": "next", "messages": [message], "parent_message_id": str(uuid.uuid4()),
+            "action": "next", "messages": [message], "parent_message_id": parent,
             "model": self.model, "timezone": "Asia/Baghdad", "timezone_offset_min": 180,
             "history_and_training_disabled": False, "force_use_sse": True, "stream": True,
             "websocket_request_id": str(uuid.uuid4()),
         }
+        if cid:
+            body["conversation_id"] = cid
+        if gid:
+            body.update({"conversation_mode": {"kind": "gizmo_interaction", "gizmo_id": gid}, "conversation_origin": "tpp"})
         answer = ""
         with self.session.post(self.BASE + "/backend-api/conversation", json=body, stream=True, timeout=300) as response:
             _check_response(response)
@@ -283,6 +476,12 @@ class ChatGPTClient:
                 if event.get("error"):
                     raise RuntimeError("تعذر إكمال الطلب لدى محرك المعالجة.")
                 msg = event.get("message") or {}
+                if event.get("conversation_id"):
+                    if cid and cid != event["conversation_id"]:
+                        raise ProviderConfigurationError("الخادم لم يتابع المحادثة المختارة؛ اختر محادثة صالحة من الإدارة.")
+                    self.state["conversation_id"] = event["conversation_id"]
+                if msg.get("id"):
+                    self.state["parent_message_id"] = msg["id"]
                 if msg.get("author", {}).get("role") == "assistant":
                     value = "".join(part for part in msg.get("content", {}).get("parts", []) if isinstance(part, str))
                     if value:
@@ -290,7 +489,7 @@ class ChatGPTClient:
         return answer
 
 
-def complete_external(provider, prompt, images=(), *, max_attempts=2, thinking_enabled=False, config=None):
+def complete_external(provider, prompt, images=(), *, max_attempts=2, thinking_enabled=False, config=None, files=()):
     if provider not in ("gemini", "gpt"):
         raise ProviderConfigurationError("إعداد المعالجة غير صالح. يرجى التواصل مع إدارة البوت.")
     config = config or ProcessingConfig(
@@ -304,10 +503,20 @@ def complete_external(provider, prompt, images=(), *, max_attempts=2, thinking_e
     # adds a prompt instruction only; never invent provider protocol fields.
     if thinking_enabled:
         prompt += "\n\nCheck every line carefully against the source before returning the final answer only."
+    with PROVIDER_LOCKS[provider]:
+        return _complete_persistent(provider, prompt, images, files, config, max_attempts)
+
+
+def _complete_persistent(provider, prompt, images, files, config, max_attempts):
+    document = load_provider_thread(provider)
+    state, revision = document.get("state") or {}, document.get("revision", 0)
     for attempt in range(max(1, max_attempts)):
         client = GeminiClient(config) if provider == "gemini" else ChatGPTClient(config)
+        client.state = dict(state)
         try:
-            answer = client.complete(prompt, images).strip()
+            answer = client.complete(prompt, images, files).strip()
+            if not client.state.get("conversation_id"):
+                raise ProviderConfigurationError("لم يصل معرّف المحادثة. راجع المحادثات من الإدارة قبل إعادة الطلب.")
             if not answer:
                 raise RuntimeError("استجابة فارغة من محرك المعالجة — سيُعاد المحاولة.")
             return answer
@@ -318,4 +527,8 @@ def complete_external(provider, prompt, images=(), *, max_attempts=2, thinking_e
                 raise RuntimeError("تعذر إكمال المعالجة. تحقق من الجلسة أو أعد المحاولة لاحقًا.") from None
             time.sleep(2 * (attempt + 1))
         finally:
+            # Preserve an allocated server ID even on a later stream failure.
+            if client.state.get("conversation_id"):
+                state = dict(client.state)
+                save_provider_thread(provider, state, revision)
             client.session.close()

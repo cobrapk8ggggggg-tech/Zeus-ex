@@ -3,6 +3,7 @@ import io
 import json
 import os
 import unittest
+from copy import deepcopy
 from unittest.mock import MagicMock, patch
 
 from PIL import Image
@@ -40,7 +41,7 @@ def gemini_snapshot(text):
 
 
 def gpt_event(text, role="assistant"):
-    return b"data: " + json.dumps({"message": {
+    return b"data: " + json.dumps({"conversation_id": "test-conversation", "message": {
         "author": {"role": role}, "content": {"parts": [text]},
     }}).encode()
 
@@ -52,6 +53,16 @@ class ProviderTests(unittest.TestCase):
             "CHATGPT_ACCESS_TOKEN": account_token(), "CHATGPT_MODEL": "auto",
         })
         self.env.start()
+        self.states = {}
+        def load(provider):
+            return {"revision": 0, "state": deepcopy(self.states.get(provider, {}))}
+        def save(provider, state, revision):
+            self.states[provider] = deepcopy(state)
+            return True
+        for name, side_effect in (("load_provider_thread", load), ("save_provider_thread", save)):
+            handler = patch("utils.providers." + name, side_effect=side_effect)
+            handler.start()
+            self.addCleanup(handler.stop)
         config_patch = patch("utils.providers.load_processing_config", return_value={})
         config_patch.start()
         self.addCleanup(config_patch.stop)
@@ -125,6 +136,38 @@ class ProviderTests(unittest.TestCase):
         session.post.assert_not_called()
         session.close.assert_called_once()
 
+    @patch("utils.providers.requests.Session")
+    def test_gemini_resumes_all_four_saved_context_fields(self, factory):
+        self.states["gemini"] = {"conversation_id": "conversation", "response_id": "saved-response", "choice_id": "saved-choice", "at_token": "saved-at"}
+        session = factory.return_value
+        session.get.return_value = response(text='"SNlM0e":"csrf","FdrFJe":"123"')
+        session.post.return_value = response(lines=[json.dumps([gemini_snapshot("answer")]).encode()])
+        providers.complete_external("gemini", "continue")
+        body = json.loads(json.loads(session.post.call_args.kwargs["data"]["f.req"])[1])
+        self.assertEqual(body[2][:3], ["conversation", "saved-response", "saved-choice"])
+        self.assertEqual(body[2][9], "saved-at")
+
+    @patch("utils.providers.requests.Session")
+    def test_gpt_project_and_parent_are_in_every_continuation(self, factory):
+        self.states["gpt"] = {"conversation_id": "test-conversation", "gizmo_id": "project-id"}
+        factory.return_value.get.return_value = response(data={"current_node": "current-parent"})
+        factory.return_value.post.return_value = response(lines=[gpt_event("answer"), b"data: [DONE]"])
+        providers.complete_external("gpt", "continue")
+        body = factory.return_value.post.call_args.kwargs["json"]
+        self.assertEqual(body["conversation_id"], "test-conversation")
+        self.assertEqual(body["parent_message_id"], "current-parent")
+        self.assertEqual(body["conversation_mode"], {"kind": "gizmo_interaction", "gizmo_id": "project-id"})
+        self.assertEqual(body["messages"][0]["metadata"]["gizmo_id"], "project-id")
+
+    @patch("utils.providers.requests.Session")
+    def test_server_cannot_silently_replace_owner_selected_chat(self, factory):
+        self.states["gpt"] = {"conversation_id": "owner-chosen-chat"}
+        factory.return_value.get.return_value = response(data={"current_node": "current-parent"})
+        factory.return_value.post.return_value = response(lines=[gpt_event("wrong conversation")])
+        with self.assertRaises(providers.ProviderConfigurationError):
+            providers.complete_external("gpt", "continue")
+        self.assertEqual(self.states["gpt"]["conversation_id"], "owner-chosen-chat")
+
     @patch("utils.providers.requests.put")
     @patch("utils.providers.requests.Session")
     def test_gpt_multiple_images_real_dimensions_and_full_snapshots(self, factory, put):
@@ -151,25 +194,29 @@ class ProviderTests(unittest.TestCase):
         session.close.assert_called_once()
 
     @patch("utils.providers.requests.Session")
-    def test_text_requests_have_no_image_upload_and_no_shared_conversation(self, factory):
+    def test_text_requests_resume_one_persistent_conversation(self, factory):
         sessions = [MagicMock(), MagicMock()]
         factory.side_effect = sessions
         bodies = []
         for session in sessions:
             session.post.return_value = response(lines=[gpt_event("answer"), b"data: [DONE]"])
+            session.get.return_value = response(data={"current_node": "server-current-node"})
         for _ in range(2):
             self.assertEqual(providers.complete_external("gpt", "translate"), "answer")
         for session in sessions:
             self.assertEqual(session.post.call_count, 1)
             bodies.append(session.post.call_args.kwargs["json"])
             self.assertEqual(bodies[-1]["messages"][0]["content"], {"content_type": "text", "parts": ["translate"]})
-        self.assertNotEqual(bodies[0]["parent_message_id"], bodies[1]["parent_message_id"])
+        self.assertNotIn("conversation_id", bodies[0])
+        self.assertEqual(bodies[1]["conversation_id"], "test-conversation")
+        self.assertEqual(bodies[1]["parent_message_id"], "server-current-node")
+        self.assertEqual(self.states["gpt"]["conversation_id"], "test-conversation")
 
     @patch("utils.providers.time.sleep")
     @patch("utils.providers.requests.Session")
     def test_failed_or_empty_stream_is_retried_then_raises(self, factory, sleep):
         session = factory.return_value
-        session.post.side_effect = [response(status=429), response(lines=[b"data: [DONE]"])]
+        session.post.side_effect = [response(status=429), response(lines=[gpt_event(""), b"data: [DONE]"])]
         with self.assertRaises(RuntimeError):
             providers.complete_external("gpt", "prompt", max_attempts=2)
         self.assertEqual(factory.call_count, 2)

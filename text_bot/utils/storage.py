@@ -109,7 +109,7 @@ def load_processing_config():
 
 
 def save_processing_config(**changes):
-    allowed = {"provider", "chatgpt_model", "gemini_cookie_header", "chatgpt_access_token"}
+    allowed = {"provider", "chatgpt_model", "gemini_cookie_header", "chatgpt_access_token", "ocr_crop_height", "ocr_double_check", "ocr_scope"}
     if not changes or set(changes) - allowed:
         raise ValueError("إعداد معالجة غير صالح.")
     _get_db().bot_settings.update_one(
@@ -117,6 +117,44 @@ def save_processing_config(**changes):
         {"$set": {**changes, "updated_at": int(time.time())}},
         upsert=True,
     )
+
+
+def load_provider_thread(provider):
+    collection = _get_db().provider_threads
+    collection.update_one({"_id": provider}, {"$setOnInsert": {"revision": 0, "state": {}}}, upsert=True)
+    return collection.find_one({"_id": provider})
+
+
+def _remember_provider_thread(provider, state):
+    cid = state.get("conversation_id")
+    if cid:
+        _get_db().provider_history.update_one(
+            {"_id": provider + ":" + cid},
+            {"$set": {"provider": provider, "state": state, "updated_at": int(time.time())}}, upsert=True,
+        )
+
+
+def save_provider_thread(provider, state, revision):
+    result = _get_db().provider_threads.update_one(
+        {"_id": provider, "revision": revision},
+        {"$set": {"state": state, "updated_at": int(time.time())}},
+    )
+    if result.matched_count:
+        _remember_provider_thread(provider, state)
+    return bool(result.matched_count)
+
+
+def select_provider_thread(provider, state):
+    previous = load_provider_thread(provider)
+    _remember_provider_thread(provider, previous.get("state") or {})
+    _get_db().provider_threads.update_one(
+        {"_id": provider},
+        {"$set": {"state": state, "updated_at": int(time.time())}, "$inc": {"revision": 1}},
+    )
+
+
+def list_provider_threads(provider):
+    return [row["state"] for row in _get_db().provider_history.find({"provider": provider}).sort("updated_at", -1).limit(100)]
 
 
 def save_accounts_data(user_id, data):
