@@ -18,6 +18,9 @@ from utils.vision_ocr import extract_page
 
 GOLDEN = {
     "1.jpg": ["엄마는 산에서의 일을 기억 못해", "이름 강진혁", "보유한 코인 1,283,288", "이걸 얻게 될 줄이야", "거처를 마련해 주든가"],
+    "2.jpg": ["주위 병사들은 그 병사를 보고 비웃기 시작했지"],
+    "3.jpg": ["I USED IT BACK AT MY CASTLE DURING THE TUTORIAL", "WHEN IT WAS AT MAX LEVEL, I COULD EVEN READ THE OTHER PERSON'S MIND",
+              "恭喜你解锁第一个技能栏", "没想到神话级职业者", "连升3级", "物理防御", "魔法防御"],
     "4.jpg": ["매그너스 네가 그렇게 말해도", "영애와 잘 됐으면 좋겠어", "나는 너에게", "내 마음이 변함없다는 걸 계속 증명할게"],
 }
 
@@ -38,11 +41,11 @@ def english_fixture(api):
     return output.getvalue(), lines
 
 
-def run_validation(api, marker, folder):
+def run_validation(api, marker, folder, mode="full"):
     collection = _get_db().validation_runs
     if collection.find_one({"_id": marker}):
         return
-    report = {"_id": marker, "started_at": int(time.time()), "status": "running", "pages": [], "accounts": {}}
+    report = {"_id": marker, "mode": mode, "started_at": int(time.time()), "status": "running", "pages": [], "accounts": {}}
     collection.insert_one(report)
     print("[ZEUS_VALIDATION] " + json.dumps({"run": marker, "event": "started"}), flush=True)
     try:
@@ -67,6 +70,9 @@ def run_validation(api, marker, folder):
                 report["accounts"][provider] = summary
             except Exception as exc:
                 report["accounts"][provider] = {"status": "failed", "error": api.sanitize_error(exc)}
+        if mode == "accounts":
+            report["status"] = "completed"
+            return
         if report["accounts"].get("gpt", {}).get("status") != "connected":
             raise RuntimeError("جلسة GPT المحفوظة غير متصلة؛ لم تُجر تجربة استخراج حية.")
         images = api.process_drive_link("https://drive.google.com/drive/folders/" + folder)
@@ -111,4 +117,14 @@ def run_validation(api, marker, folder):
 
 
 def latest_report():
-    return _get_db().validation_runs.find_one({}, {"_id": 0}, sort=[("started_at", -1)])
+    runs = _get_db().validation_runs
+    report = runs.find_one({"pages.0": {"$exists": True}}, {"_id": 0}, sort=[("started_at", -1)])
+    report = report or runs.find_one({}, {"_id": 0}, sort=[("started_at", -1)])
+    if report:
+        for page in report.get("pages", []):
+            page["checks"] = [{"reference": ref, "found": normalized(ref) in normalized(page["text"])}
+                              for ref in GOLDEN.get(page["name"], [])]
+        recheck = runs.find_one({"mode": "accounts"}, {"_id": 0}, sort=[("started_at", -1)])
+        if recheck and recheck.get("finished_at", 0) > report.get("finished_at", 0):
+            report["account_recheck"] = recheck
+    return report

@@ -4,6 +4,8 @@ import json
 import os
 import unittest
 from copy import deepcopy
+import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
 from PIL import Image
@@ -167,6 +169,34 @@ class ProviderTests(unittest.TestCase):
         with self.assertRaises(providers.ProviderConfigurationError):
             providers.complete_external("gpt", "continue")
         self.assertEqual(self.states["gpt"]["conversation_id"], "owner-chosen-chat")
+
+    @patch("utils.providers.requests.Session")
+    def test_projects_use_original_supported_limit_of_five_conversations(self, factory):
+        factory.return_value.get.return_value = response(data={"items": [{"gizmo": {"gizmo": {"id": "project", "display": {"name": "Manga"}}}, "conversations": {"items": [{"id": "chat"}]}}]})
+        client = providers.ChatGPTClient()
+        self.assertEqual(client.projects()[0]["chats"], [{"id": "chat"}])
+        self.assertIn("conversations_per_gizmo=5", factory.return_value.get.call_args.args[0])
+
+    def test_parallel_requests_do_not_fork_the_shared_conversation(self):
+        active = 0
+        maximum = 0
+        starts = []
+        class Client:
+            def __init__(inner, config):
+                inner.session = MagicMock()
+            def complete(inner, prompt, images, files):
+                nonlocal active, maximum
+                starts.append(inner.state.get("conversation_id"))
+                active += 1
+                maximum = max(maximum, active)
+                time.sleep(.01)
+                inner.state["conversation_id"] = "one-shared-conversation"
+                active -= 1
+                return "answer"
+        with patch("utils.providers.ChatGPTClient", Client), ThreadPoolExecutor(max_workers=4) as executor:
+            self.assertEqual(list(executor.map(lambda _: providers.complete_external("gpt", "prompt"), range(4))), ["answer"] * 4)
+        self.assertEqual(maximum, 1)
+        self.assertEqual(starts, [None] + ["one-shared-conversation"] * 3)
 
     @patch("utils.providers.requests.put")
     @patch("utils.providers.requests.Session")

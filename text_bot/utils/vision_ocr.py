@@ -103,10 +103,11 @@ def parse_regions(raw):
         if box[2] <= box[0] or box[3] <= box[1]:
             raise RuntimeError("إحداثيات النص غير مرتبة.")
         text = " ".join(region["text"].split())
+        marked = bool(re.fullmatch(r"[\[⟦<]\s*(?:illegible|unreadable|غير\s+مقروء)\s*[\]⟧>]", text, re.I))
         if not text and not region.get("illegible"):
             continue
-        clean.append({"text": text if text else "⟦غير مقروء⟧", "box": box,
-                      "kind": str(region.get("kind", "speech")), "illegible": bool(region.get("illegible"))})
+        clean.append({"text": "⟦غير مقروء⟧" if marked or not text else text, "box": box,
+                      "kind": str(region.get("kind", "speech")), "illegible": bool(region.get("illegible")) or marked})
     return clean
 
 
@@ -123,6 +124,50 @@ def reconcile_audit(first, audited):
         if not any(_overlap(item["box"], other["box"]) > .45 for other in audited):
             result.append(item)
     return sorted(result, key=lambda r: (r["box"][1], r["box"][0]))
+
+
+def refine_small_regions(crop, regions, config):
+    """Give difficult text its own enlarged image instead of guessing it."""
+    with Image.open(io.BytesIO(crop.data)) as image:
+        image = image.convert("RGB")
+    result = []
+    rescued = 0
+    for item in regions:
+        difficult = item.get("illegible") or (config.ocr_double_check and len(item["text"]) > 180 and (item.get("kind") == "ui" or item["text"].count(":") >= 4))
+        if not difficult or rescued >= 4:
+            result.append(item)
+            continue
+        rescued += 1
+        x1, y1, x2, y2 = item["box"]
+        left, right = max(0, int(x1 * image.width / 1000) - 30), min(image.width, int(x2 * image.width / 1000) + 30)
+        top, bottom = max(0, int(y1 * image.height / 1000) - 30), min(image.height, int(y2 * image.height / 1000) + 30)
+        focus = image.crop((left, top, right, bottom))
+        factor = min(2.5, 1600 / max(1, focus.width), 2200 / max(1, focus.height))
+        if factor > 1:
+            focus = focus.resize((round(focus.width * factor), round(focus.height * factor)), Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        focus.save(output, format="PNG")
+        focused = Crop(output.getvalue(), crop.name + ".detail.png", 0, focus.height, 0, focus.height, focus.width)
+        try:
+            prompt = transcription_prompt(focused, config.ocr_scope)
+            prompt += "\nThis is a magnified source region. Read tiny status/UI text row by row. One row per record. Copy visible glyphs only; do not guess illegible letters."
+            improved = parse_regions(complete_external(config.provider, prompt, [(focused.data, focused.name)], config=config, max_attempts=1))
+            if not improved or all(r.get("illegible") for r in improved):
+                result.append(item)
+                continue
+            if not item.get("illegible") and sum(len(r["text"]) for r in improved) < len(item["text"]) * .7:
+                result.append(item)
+                continue
+            for record in improved:
+                a, b, c, d = record["box"]
+                record["box"] = [(left + a * (right - left) / 1000) * 1000 / image.width,
+                                 (top + b * (bottom - top) / 1000) * 1000 / image.height,
+                                 (left + c * (right - left) / 1000) * 1000 / image.width,
+                                 (top + d * (bottom - top) / 1000) * 1000 / image.height]
+            result.extend(improved)
+        except Exception:
+            result.append(item)  # Retain an explicit unreadable marker, never fabricate text.
+    return result
 
 
 def extract_page(data, name, config, *, bubble_spacing=True, progress=None):
@@ -145,6 +190,7 @@ def extract_page(data, name, config, *, bubble_spacing=True, progress=None):
                         [(crop.data, crop.name)], config=config, max_attempts=1,
                     ))
                     regions = reconcile_audit(regions, audited)
+                regions = refine_small_regions(crop, regions, config)
                 error = None
                 break
             except Exception as exc:

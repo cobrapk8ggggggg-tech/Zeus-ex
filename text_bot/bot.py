@@ -4098,7 +4098,8 @@ async def on_ready():
     if marker and re.fullmatch(r"[A-Za-z0-9_-]{10,100}", folder) and not getattr(bot, "_validation_started", False):
         bot._validation_started = True
         from utils.live_validation import run_validation
-        bot._validation_task = asyncio.create_task(asyncio.to_thread(run_validation, sys.modules[__name__], marker, folder))
+        mode = "accounts" if os.getenv("ZEUS_VALIDATION_MODE") == "accounts" else "full"
+        bot._validation_task = asyncio.create_task(asyncio.to_thread(run_validation, sys.modules[__name__], marker, folder, mode))
     # نظام الإيموجي المخصص:
     # - يُحمّل أولاً من utils/emojis.json إذا كان مطابقًا لتطبيق هذا البوت.
     # - إذا كانت الخريطة فارغة (لا إيموجيات مخصصة) تُجبر المزامنة على العمل

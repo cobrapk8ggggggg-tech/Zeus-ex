@@ -181,7 +181,8 @@ class ProviderConsole(discord.ui.LayoutView):
         for start in range(0, len(actions), 3):
             row = discord.ui.ActionRow()
             for label, action, emoji in actions[start:start + 3]:
-                button = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, emoji=self.api.emoji_manager.partial(emoji))
+                style = discord.ButtonStyle.success if action == "activate" else discord.ButtonStyle.secondary
+                button = discord.ui.Button(label=label, style=style, emoji=self.api.emoji_manager.partial(emoji))
                 async def callback(interaction, action=action):
                     await self.action(interaction, action)
                 button.callback = callback
@@ -321,7 +322,8 @@ class ProviderConsole(discord.ui.LayoutView):
             await interaction.followup.send("تعذر إكمال الإجراء. تحقق من الجلسة والاتصال. لم تُغيّر المحادثة تلقائيًا.", ephemeral=True)
 
     async def receive_file(self, interaction, action, config):
-        key = (self.api.OWNER_ID, self.provider, action)
+        provider = config.provider
+        key = (self.api.OWNER_ID, provider, action)
         if key in _UPLOADS:
             await interaction.followup.send("يوجد انتظار ملف قائم بالفعل؛ أرسل الملف في الخاص أو انتظر انتهاء المهلة.", ephemeral=True)
             return
@@ -357,12 +359,12 @@ class ProviderConsole(discord.ui.LayoutView):
                 is_image = (attachment.content_type or "").startswith("image/") or attachment.filename.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif"))
                 prompt = (message.content or "").strip()
                 if not prompt:
-                    if len(_PENDING[self.provider]) >= 5:
+                    if len(_PENDING[provider]) >= 5:
                         raise ValueError("خمسة مرفقات كحد أقصى")
-                    _PENDING[self.provider].append((data, attachment.filename, is_image))
+                    _PENDING[provider].append((data, attachment.filename, is_image))
                     await dm.send("أضيف المرفق. أرسل سؤالك من زر رسالة تجريبية في /zx، أو امسح المرفقات من اللوحة.")
                     return
-                answer = await asyncio.to_thread(complete_external, self.provider, prompt,
+                answer = await asyncio.to_thread(complete_external, provider, prompt,
                     [(data, attachment.filename)] if is_image else (), files=() if is_image else [(data, attachment.filename)], config=config)
                 await interaction.followup.send(file=discord.File(io.BytesIO(answer.encode()), filename="attachment-response.txt"), ephemeral=True)
         except asyncio.TimeoutError:

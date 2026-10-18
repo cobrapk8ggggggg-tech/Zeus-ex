@@ -401,7 +401,7 @@ class ChatGPTClient:
         return self.get(f"/backend-api/conversations?offset={offset}&limit=50&order=updated&is_archived=false").get("items", [])
 
     def projects(self):
-        data = self.get("/backend-api/gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=50&limit=50")
+        data = self.get("/backend-api/gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=5&limit=50")
         result = []
         for item in data.get("items", []):
             project = item.get("gizmo", {}).get("gizmo", {})

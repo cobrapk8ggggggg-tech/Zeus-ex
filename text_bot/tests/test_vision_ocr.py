@@ -49,3 +49,11 @@ class VisionTests(unittest.TestCase):
         with patch("utils.vision_ocr.complete_external", return_value="not JSON"):
             with self.assertRaises(RuntimeError):
                 extract_page(sample(1000), "test.png", ProcessingConfig(provider="gpt", ocr_double_check=False))
+
+    def test_illegible_text_gets_a_focused_rescue_before_keeping_marker(self):
+        first = {"regions": [{**region("⟦illegible⟧", [100, 100, 500, 300]), "illegible": True}]}
+        second = {"regions": [region("Clearly printed text", [100, 100, 900, 900])]}
+        with patch("utils.vision_ocr.complete_external", side_effect=[json.dumps(first), json.dumps(second)]) as request:
+            text = extract_page(sample(1000), "test.png", ProcessingConfig(provider="gpt", ocr_double_check=False))
+        self.assertEqual(text, "Clearly printed text")
+        self.assertEqual(request.call_count, 2)
