@@ -231,8 +231,9 @@ class ProviderConsole(discord.ui.LayoutView):
             title = self.state.get('title')
             if cid and title == "محادثة جديدة":
                 title = "المحادثة الحالية"
+            project_line = f"المشروع: **{safe(self.state.get('project_name') or 'محادثة عادية')}**\n" if self.provider == "gpt" else ""
             self.text(box, f"## {{emoji:shieldcheck}} الجلسة والنموذج\nالجلسة: **{'محفوظة' if has_session else 'غير مضافة بعد'}** · النموذج: `{safe(model)}`\n"
-                          f"المشروع: **{safe(self.state.get('project_name') or 'محادثة عادية')}**\n"
+                          f"{project_line}"
                           f"المحادثة: **{safe(title or ('المحادثة المحفوظة' if cid else 'جديدة عند أول رسالة'))}**\n"
                           f"المعرّف: `{safe(cid)}`\nالمرفقات الجاهزة للرسالة التالية: `{len(_PENDING[self.provider])}`\n-# كل الصور والأجزاء تتابع هذه المحادثة. لا تتغير تلقائيًا ولا تُحذف بعد الاستخراج.")
             if self.provider == "gpt":

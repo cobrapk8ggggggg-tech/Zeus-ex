@@ -16,6 +16,8 @@ class ConsoleTests(unittest.IsolatedAsyncioTestCase):
             expected = {"qwen": "إدارة الحسابات", "gpt": "مشاريع الحساب", "gemini": "رفع ملف الكوكيز"}
             for key, label in expected.items():
                 self.assertEqual(label in labels, key == provider)
+            if provider == "gemini":
+                self.assertNotIn("المشروع:", str(panel.to_components()))
 
     async def test_owner_can_activate_provider_privately(self):
         config = ProcessingConfig(provider="gpt")
