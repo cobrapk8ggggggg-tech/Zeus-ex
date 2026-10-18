@@ -81,9 +81,23 @@ def run_validation(api, marker, folder, mode="full"):
         initial = provider_thread("gpt").get("conversation_id")
         conversation = initial
         report["same_conversation"] = True
+        if mode == "focused":
+            data = next(data for data, name in images if name == "3.jpg")
+            with Image.open(io.BytesIO(data)) as image:
+                crop = image.crop((0, max(0, image.height - 800), image.width, image.height))
+                output = io.BytesIO()
+                crop.save(output, format="PNG")
+            text = extract_page(output.getvalue(), "3-small-numeric-ui.png", candidate)
+            expected = "22106649亿5999万9075"
+            report["fine_numeric_check"] = {"expected": expected, "found": normalized(expected) in normalized(text), "text": text}
+            report["same_conversation"] = provider_thread("gpt").get("conversation_id") == conversation
+            report["status"] = "completed"
+            return
         for data, name in images:
             started = time.monotonic()
-            text = extract_page(data, name, candidate)
+            def progress(stage, page, current=0, total=0, label=""):
+                print("[ZEUS_VALIDATION_REGION] " + json.dumps({"page": page, "region": current, "total": total}), flush=True)
+            text = extract_page(data, name, candidate, progress=progress)
             cid = provider_thread("gpt").get("conversation_id")
             conversation = conversation or cid
             report["same_conversation"] &= bool(cid and cid == conversation)
@@ -99,6 +113,15 @@ def run_validation(api, marker, folder, mode="full"):
         text = extract_page(data, "english-fixture.png", candidate)
         report["english_language_lock"] = {"output": text, "all_lines_present": all(normalized(line) in normalized(text) for line in lines),
                                            "no_korean_conversion": not bool(re.search(r"[\uac00-\ud7a3]", text))}
+        if any(name == "3.jpg" for _, name in images):
+            data = next(data for data, name in images if name == "3.jpg")
+            with Image.open(io.BytesIO(data)) as image:
+                crop = image.crop((0, max(0, image.height - 800), image.width, image.height))
+                output = io.BytesIO()
+                crop.save(output, format="PNG")
+            text = extract_page(output.getvalue(), "3-small-numeric-ui.png", candidate)
+            expected = "22106649亿5999万9075"
+            report["fine_numeric_check"] = {"expected": expected, "found": normalized(expected) in normalized(text), "text": text}
         report["same_conversation"] &= provider_thread("gpt").get("conversation_id") == conversation
         report["status"] = "completed"
     except Exception as exc:
@@ -127,4 +150,7 @@ def latest_report():
         recheck = runs.find_one({"mode": "accounts"}, {"_id": 0}, sort=[("started_at", -1)])
         if recheck and recheck.get("finished_at", 0) > report.get("finished_at", 0):
             report["account_recheck"] = recheck
+        focus = runs.find_one({"mode": "focused"}, {"_id": 0}, sort=[("started_at", -1)])
+        if focus:
+            report["focused_recheck"] = focus
     return report

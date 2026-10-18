@@ -35,7 +35,7 @@ BOT_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "656783724662226963"))
 TEMP_API_URL = os.getenv("TEMP_API_URL", "").rstrip("/")
 BASE_QWEN_URL = os.getenv("BASE_QWEN_URL", "https://chat.qwen.ai/api/v2").rstrip("/")
-BOT_VERSION = os.getenv("BOT_VERSION", "2.7.0")
+BOT_VERSION = os.getenv("BOT_VERSION", "3.0.0")
 GDRIVE_API_KEY = os.getenv("GDRIVE_API_KEY", "").strip()
 
 MAX_IMAGES_PER_REQUEST = int(os.getenv("MAX_IMAGES_PER_REQUEST", "10"))
@@ -4098,7 +4098,8 @@ async def on_ready():
     if marker and re.fullmatch(r"[A-Za-z0-9_-]{10,100}", folder) and not getattr(bot, "_validation_started", False):
         bot._validation_started = True
         from utils.live_validation import run_validation
-        mode = "accounts" if os.getenv("ZEUS_VALIDATION_MODE") == "accounts" else "full"
+        mode = os.getenv("ZEUS_VALIDATION_MODE", "full")
+        mode = mode if mode in ("accounts", "focused") else "full"
         bot._validation_task = asyncio.create_task(asyncio.to_thread(run_validation, sys.modules[__name__], marker, folder, mode))
     # نظام الإيموجي المخصص:
     # - يُحمّل أولاً من utils/emojis.json إذا كان مطابقًا لتطبيق هذا البوت.

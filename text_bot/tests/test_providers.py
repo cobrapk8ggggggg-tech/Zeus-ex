@@ -198,6 +198,13 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(maximum, 1)
         self.assertEqual(starts, [None] + ["one-shared-conversation"] * 3)
 
+    def test_another_accounts_chat_is_never_used(self):
+        self.states["gpt"] = {"account_id": "another-account", "conversation_id": "other-chat"}
+        with patch("utils.providers.requests.Session") as session:
+            with self.assertRaises(providers.ProviderConfigurationError):
+                providers.complete_external("gpt", "prompt")
+        session.assert_not_called()
+
     @patch("utils.providers.requests.put")
     @patch("utils.providers.requests.Session")
     def test_gpt_multiple_images_real_dimensions_and_full_snapshots(self, factory, put):

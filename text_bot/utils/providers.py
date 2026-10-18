@@ -43,6 +43,7 @@ class ProcessingConfig:
     ocr_crop_height: int = 1700
     ocr_double_check: bool = True
     ocr_scope: str = "all"
+    ocr_rescue_limit: int = 4
 
 
 def get_processing_config():
@@ -55,6 +56,7 @@ def get_processing_config():
         ocr_crop_height=max(900, min(2400, int(saved.get("ocr_crop_height", 1700)))),
         ocr_double_check=bool(saved.get("ocr_double_check", True)),
         ocr_scope=saved.get("ocr_scope", "all"),
+        ocr_rescue_limit=max(0, min(12, int(saved.get("ocr_rescue_limit", 4)))),
     )
 
 
@@ -193,6 +195,8 @@ def new_thread(provider, *, ordinary=False):
         old = provider_thread(provider)
         state = {k: old[k] for k in ("gizmo_id", "project_name") if k in old} if provider == "gpt" and not ordinary else {}
         state["title"] = "محادثة جديدة"
+        if provider == "gpt":
+            state["account_id"] = _chatgpt_credentials(get_processing_config())[1]
         select_provider_thread(provider, state)
 
 
@@ -462,6 +466,8 @@ class ChatGPTClient:
         parent = str(uuid.uuid4())
         if cid:
             conversation = self.conversation(cid)
+            if conversation.get("title"):
+                self.state["title"] = conversation["title"]
             parent = conversation.get("current_node")
             if not parent:
                 raise RuntimeError("المحادثة المحددة لا تحتوي عقدة متابعة صالحة؛ اخترها مجددًا من الإدارة.")
@@ -529,6 +535,11 @@ def complete_external(provider, prompt, images=(), *, max_attempts=2, thinking_e
 def _complete_persistent(provider, prompt, images, files, config, max_attempts):
     document = load_provider_thread(provider)
     state, revision = document.get("state") or {}, document.get("revision", 0)
+    if provider == "gpt":
+        account = _chatgpt_credentials(config)[1]
+        if state.get("account_id") and state["account_id"] != account:
+            raise ProviderConfigurationError("المحادثة محفوظة لحساب مختلف. اختر محادثة لهذا الحساب من الإدارة.")
+        state["account_id"] = account
     for attempt in range(max(1, max_attempts)):
         client = GeminiClient(config) if provider == "gemini" else ChatGPTClient(config)
         client.state = dict(state)

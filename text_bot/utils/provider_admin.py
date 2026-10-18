@@ -108,6 +108,10 @@ class TextModal(discord.ui.Modal):
             self.value = discord.ui.TextInput(label={"token": "Access token لحساب ChatGPT", "message": "نص الرسالة", "open_chat": "رابط المحادثة أو المعرّف", "model": "معرّف النموذج أو auto"}[action],
                                              style=discord.TextStyle.paragraph, max_length=4000)
         self.add_item(self.value)
+        self.rescue_limit = None
+        if action == "quality":
+            self.rescue_limit = discord.ui.TextInput(label="حد التكبير لكل صفحة (0–12)", default=str(console.config.ocr_rescue_limit))
+            self.add_item(self.rescue_limit)
 
     async def interaction_check(self, interaction):
         return await guard(self.console.api, interaction)
@@ -128,7 +132,7 @@ class TextModal(discord.ui.Modal):
                     old = None
                 await asyncio.to_thread(save_processing_config, chatgpt_access_token=value)
                 if old and old["account_id"] != details["account_id"]:
-                    await asyncio.to_thread(new_thread, "gpt", ordinary=True)
+                    await asyncio.to_thread(choose_thread, "gpt", {"title": "محادثة جديدة", "account_id": details["account_id"]})
             elif self.action == "model":
                 if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value):
                     raise ValueError()
@@ -137,7 +141,10 @@ class TextModal(discord.ui.Modal):
                 height = int(value)
                 if not 900 <= height <= 2400:
                     raise ValueError()
-                await asyncio.to_thread(save_processing_config, ocr_crop_height=height)
+                rescue_limit = int(self.rescue_limit.value)
+                if not 0 <= rescue_limit <= 12:
+                    raise ValueError()
+                await asyncio.to_thread(save_processing_config, ocr_crop_height=height, ocr_rescue_limit=rescue_limit)
             elif self.action == "open_chat":
                 match = re.search(r"(?:/c/)?([a-zA-Z0-9-]{16,})/?(?:\?.*)?$", value)
                 if not match:
@@ -210,9 +217,12 @@ class ProviderConsole(discord.ui.LayoutView):
             has_session = bool(self.config.chatgpt_access_token) if self.provider == "gpt" else bool(self.config.gemini_cookie_header)
             cid = self.state.get("conversation_id")
             model = self.config.chatgpt_model if self.provider == "gpt" else "adaptive"
+            title = self.state.get('title')
+            if cid and title == "محادثة جديدة":
+                title = "المحادثة الحالية"
             self.text(box, f"## {{emoji:shieldcheck}} الجلسة والنموذج\nالجلسة: **{'محفوظة' if has_session else 'غير مضافة بعد'}** · النموذج: `{safe(model)}`\n"
                           f"المشروع: **{safe(self.state.get('project_name') or 'محادثة عادية')}**\n"
-                          f"المحادثة: **{safe(self.state.get('title') or ('المحادثة المحفوظة' if cid else 'جديدة عند أول رسالة'))}**\n"
+                          f"المحادثة: **{safe(title or ('المحادثة المحفوظة' if cid else 'جديدة عند أول رسالة'))}**\n"
                           f"المعرّف: `{safe(cid)}`\nالمرفقات الجاهزة للرسالة التالية: `{len(_PENDING[self.provider])}`\n-# كل الصور والأجزاء تتابع هذه المحادثة. لا تتغير تلقائيًا ولا تُحذف بعد الاستخراج.")
             if self.provider == "gpt":
                 actions = [("معلومات الحساب والتوكن", "account", "infocircle"), ("تحديث التوكن", "token", "lock"),
@@ -230,6 +240,7 @@ class ProviderConsole(discord.ui.LayoutView):
         box.add_item(discord.ui.Separator())
         if self.provider != "qwen":
             self.text(box, f"## {{emoji:photo}} دقة الاستخراج\nارتفاع المقطع: `{self.config.ocr_crop_height}px` · التدقيق المزدوج: **{'مفعّل' if self.config.ocr_double_check else 'معطّل'}**\n"
+                          f"حد القراءة المكبّرة: `{self.config.ocr_rescue_limit}` مواضع لكل صفحة\n"
                           f"النطاق: **{'كل النصوص بما فيها مربعات الحالة والأصوات' if self.config.ocr_scope == 'all' else 'الحوار والسرد ومربعات الحالة بدون الأصوات'}**\n"
                           "حفظ اللغة والحروف الأصلية • ترتيب رأسي • إزالة تكرار التداخل فقط")
             self.buttons(box, [("حجم المقاطع", "quality", "adjustments"), ("تبديل التدقيق المزدوج", "audit", "circlecheck"), ("نطاق النصوص", "scope", "list"), ("نتيجة آخر اختبار", "report", "chartpie")])

@@ -126,18 +126,20 @@ def reconcile_audit(first, audited):
     return sorted(result, key=lambda r: (r["box"][1], r["box"][0]))
 
 
-def refine_small_regions(crop, regions, config):
+def refine_small_regions(crop, regions, config, budget=None):
     """Give difficult text its own enlarged image instead of guessing it."""
     with Image.open(io.BytesIO(crop.data)) as image:
         image = image.convert("RGB")
     result = []
-    rescued = 0
+    budget = budget if budget is not None else [4]
     for item in regions:
-        difficult = item.get("illegible") or (config.ocr_double_check and len(item["text"]) > 180 and (item.get("kind") == "ui" or item["text"].count(":") >= 4))
-        if not difficult or rescued >= 4:
+        numeric_ui = (item.get("kind") == "ui" or ":" in item["text"] or "：" in item["text"]) and bool(re.search(r"\d[\d,.亿万]{5,}", item["text"]))
+        dense_ui = len(item["text"]) > 180 and (item.get("kind") == "ui" or item["text"].count(":") >= 4)
+        difficult = item.get("illegible") or (config.ocr_double_check and (dense_ui or numeric_ui))
+        if not difficult or budget[0] <= 0:
             result.append(item)
             continue
-        rescued += 1
+        budget[0] -= 1
         x1, y1, x2, y2 = item["box"]
         left, right = max(0, int(x1 * image.width / 1000) - 30), min(image.width, int(x2 * image.width / 1000) + 30)
         top, bottom = max(0, int(y1 * image.height / 1000) - 30), min(image.height, int(y2 * image.height / 1000) + 30)
@@ -150,7 +152,7 @@ def refine_small_regions(crop, regions, config):
         focused = Crop(output.getvalue(), crop.name + ".detail.png", 0, focus.height, 0, focus.height, focus.width)
         try:
             prompt = transcription_prompt(focused, config.ocr_scope)
-            prompt += "\nThis is a magnified source region. Read tiny status/UI text row by row. One row per record. Copy visible glyphs only; do not guess illegible letters."
+            prompt += "\nThis is a magnified source region. Read tiny status/UI text row by row. One row per record. Copy visible glyphs only; do not guess illegible letters. Check long numbers digit by digit against THIS image; never reuse a number from previous messages."
             improved = parse_regions(complete_external(config.provider, prompt, [(focused.data, focused.name)], config=config, max_attempts=1))
             if not improved or all(r.get("illegible") for r in improved):
                 result.append(item)
@@ -173,6 +175,7 @@ def refine_small_regions(crop, regions, config):
 def extract_page(data, name, config, *, bubble_spacing=True, progress=None):
     crops = make_crops(data, name, config.ocr_crop_height)
     records = []
+    rescue_budget = [config.ocr_rescue_limit]
     for index, crop in enumerate(crops, 1):
         if progress:
             progress("split_tile", name, index, len(crops), crop.name)
@@ -190,7 +193,11 @@ def extract_page(data, name, config, *, bubble_spacing=True, progress=None):
                         [(crop.data, crop.name)], config=config, max_attempts=1,
                     ))
                     regions = reconcile_audit(regions, audited)
-                regions = refine_small_regions(crop, regions, config)
+                # Overlap is context only; do not spend rescue calls on text
+                # owned by an adjacent crop, or repeatedly rescue the same edge.
+                scale = (crop.bottom - crop.top) / 1000
+                owned = [r for r in regions if crop.core_top <= crop.top + (r["box"][1] + r["box"][3]) / 2 * scale < crop.core_bottom]
+                regions = refine_small_regions(crop, owned, config, rescue_budget)
                 error = None
                 break
             except Exception as exc:

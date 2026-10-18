@@ -57,3 +57,10 @@ class VisionTests(unittest.TestCase):
             text = extract_page(sample(1000), "test.png", ProcessingConfig(provider="gpt", ocr_double_check=False))
         self.assertEqual(text, "Clearly printed text")
         self.assertEqual(request.call_count, 2)
+
+    def test_rescue_calls_are_bounded_per_page_not_per_crop(self):
+        raw = json.dumps({"regions": [{**region("⟦illegible⟧", [100, 100, 500, 300]), "illegible": True}]})
+        data = sample()
+        with patch("utils.vision_ocr.complete_external", return_value=raw) as request:
+            extract_page(data, "test.png", ProcessingConfig(provider="gpt", ocr_double_check=False))
+        self.assertLessEqual(request.call_count, len(make_crops(data, "test.png")) + 4)
