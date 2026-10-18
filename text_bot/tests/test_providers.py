@@ -249,6 +249,17 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(bodies[1]["parent_message_id"], "server-current-node")
         self.assertEqual(self.states["gpt"]["conversation_id"], "test-conversation")
 
+    @patch("utils.providers.requests.put")
+    @patch("utils.providers.requests.Session")
+    def test_non_image_file_attachment_uses_source_upload_and_ack(self, factory, put):
+        put.return_value = response(status=201)
+        factory.return_value.post.side_effect = [response(data={"upload_url": "https://blob.test/file", "file_id": "text-file"}), response(), response(lines=[gpt_event("file contents"), b"data: [DONE]"])]
+        answer = providers.complete_external("gpt", "read file", files=[(b"file contents", "file.txt")])
+        self.assertEqual(answer, "file contents")
+        message = factory.return_value.post.call_args.kwargs["json"]["messages"][0]
+        self.assertEqual(message["content"]["content_type"], "text")
+        self.assertEqual(message["metadata"]["attachments"][0]["id"], "text-file")
+
     @patch("utils.providers.time.sleep")
     @patch("utils.providers.requests.Session")
     def test_failed_or_empty_stream_is_retried_then_raises(self, factory, sleep):

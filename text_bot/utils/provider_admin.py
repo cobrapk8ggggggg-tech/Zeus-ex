@@ -37,28 +37,38 @@ async def guard(api, interaction):
     return True
 
 
-class RecordPicker(discord.ui.View):
+class RecordPicker(discord.ui.LayoutView):
     def __init__(self, console, records, action, page=0):
         super().__init__(timeout=600)
         self.console, self.records, self.action, self.page = console, records, action, page
+        box = discord.ui.Container(accent_colour=discord.Colour(0xD4AF37))
+        box.add_item(discord.ui.TextDisplay(f"## اختر من {len(records)} عنصرًا\nالصفحة {page + 1} من {max(1, (len(records) + 24) // 25)}"))
         chunk = records[page * 25:(page + 1) * 25]
         select = discord.ui.Select(placeholder="اختر العنصر لتطبيقه", options=[
             discord.SelectOption(label=str(r.get("title") or r.get("name") or r.get("slug") or r.get("conversation_id") or "بدون عنوان")[:100],
                                  value=str(page * 25 + i), description=str(r.get("id") or r.get("slug") or r.get("conversation_id") or "")[:100] or None)
             for i, r in enumerate(chunk)])
         select.callback = self.selected
-        self.add_item(select)
+        select_row = discord.ui.ActionRow()
+        select_row.add_item(select)
+        box.add_item(select_row)
+        nav_row = discord.ui.ActionRow()
         for label, target in (("السابق", page - 1), ("التالي", page + 1)):
             if 0 <= target and target * 25 < len(records):
-                button = discord.ui.Button(label=label, row=1)
+                button = discord.ui.Button(label=label)
                 async def callback(interaction, target=target):
                     if await guard(self.console.api, interaction):
                         await interaction.response.edit_message(view=RecordPicker(console, records, action, target))
                 button.callback = callback
-                self.add_item(button)
-        back = discord.ui.Button(label="العودة لإعدادات المزود", row=2)
+                nav_row.add_item(button)
+        if nav_row.children:
+            box.add_item(nav_row)
+        back = discord.ui.Button(label="العودة لإعدادات المزود")
         back.callback = self.back
-        self.add_item(back)
+        back_row = discord.ui.ActionRow()
+        back_row.add_item(back)
+        box.add_item(back_row)
+        self.add_item(box)
 
     async def interaction_check(self, interaction):
         return await guard(self.console.api, interaction)
@@ -133,6 +143,7 @@ class TextModal(discord.ui.Modal):
                 await asyncio.to_thread(save_processing_config, chatgpt_access_token=value)
                 if old and old["account_id"] != details["account_id"]:
                     await asyncio.to_thread(choose_thread, "gpt", {"title": "محادثة جديدة", "account_id": details["account_id"]})
+                    _PENDING["gpt"].clear()
             elif self.action == "model":
                 if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value):
                     raise ValueError()
@@ -265,7 +276,7 @@ class ProviderConsole(discord.ui.LayoutView):
         if not records:
             await interaction.followup.send("لا توجد عناصر في هذا القسم للحساب الحالي.", ephemeral=True)
             return
-        await interaction.edit_original_response(content=f"اختر من {len(records)} عنصرًا — الصفحات تضم 25 عنصرًا.", embeds=[], view=RecordPicker(self, records, action))
+        await interaction.edit_original_response(content=None, embeds=[], attachments=[], view=RecordPicker(self, records, action))
 
     async def action(self, interaction, action):
         if not await guard(self.api, interaction):
@@ -334,7 +345,9 @@ class ProviderConsole(discord.ui.LayoutView):
 
     async def receive_file(self, interaction, action, config):
         provider = config.provider
-        key = (self.api.OWNER_ID, provider, action)
+        # All uploads use the same owner DM. One waiter prevents a cookie file
+        # being consumed by a simultaneous attachment-upload action.
+        key = self.api.OWNER_ID
         if key in _UPLOADS:
             await interaction.followup.send("يوجد انتظار ملف قائم بالفعل؛ أرسل الملف في الخاص أو انتظر انتهاء المهلة.", ephemeral=True)
             return

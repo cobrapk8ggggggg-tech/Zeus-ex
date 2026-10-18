@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import bot
-from utils.provider_admin import ProviderConsole, TextModal, RecordPicker
+from utils.provider_admin import ProviderConsole, TextModal, RecordPicker, _UPLOADS
 from utils.providers import ProcessingConfig, parse_cookie_file
 
 
@@ -61,6 +61,27 @@ class ConsoleTests(unittest.IsolatedAsyncioTestCase):
             await picker.selected(interaction)
         self.assertEqual(choose.call_args.args[1]["gizmo_id"], "project-id")
         self.assertNotIn("conversation_id", choose.call_args.args[1])
+
+    async def test_model_and_project_pickers_keep_components_v2_compatible(self):
+        panel = ProviderConsole(bot, ProcessingConfig(provider="gpt"))
+        interaction = SimpleNamespace(edit_original_response=AsyncMock())
+        await panel.picker(interaction, [{"slug": "auto", "title": "Auto"}], "models")
+        kwargs = interaction.edit_original_response.call_args.kwargs
+        self.assertIsNone(kwargs["content"])
+        self.assertIsInstance(kwargs["view"], bot.discord.ui.LayoutView)
+        self.assertEqual(kwargs["view"].to_components()[0]["type"], 17)
+
+    async def test_cookie_wait_cannot_overlap_an_attachment_wait(self):
+        panel = ProviderConsole(bot, ProcessingConfig(provider="gpt"))
+        interaction = SimpleNamespace(followup=SimpleNamespace(send=AsyncMock()))
+        _UPLOADS.add(bot.OWNER_ID)
+        try:
+            with patch.object(bot.bot, "wait_for", new_callable=AsyncMock) as wait:
+                await panel.receive_file(interaction, "attachment", panel.config)
+            wait.assert_not_called()
+            self.assertTrue(interaction.followup.send.call_args.kwargs["ephemeral"])
+        finally:
+            _UPLOADS.discard(bot.OWNER_ID)
 
     async def test_zx_is_private_and_has_no_prefix_alias(self):
         interaction = SimpleNamespace(user=SimpleNamespace(id=bot.OWNER_ID), response=SimpleNamespace(defer=AsyncMock()), followup=SimpleNamespace(send=AsyncMock()))

@@ -11,7 +11,9 @@ from dataclasses import replace
 
 from PIL import Image, ImageDraw, ImageFont
 
-from utils.providers import get_processing_config, inspect_account, provider_thread
+from utils.providers import get_processing_config, inspect_account, provider_thread, complete_external
+import uuid
+import requests
 from utils.storage import _get_db
 from utils.vision_ocr import extract_page
 
@@ -43,11 +45,21 @@ def english_fixture(api):
 
 def run_validation(api, marker, folder, mode="full"):
     collection = _get_db().validation_runs
-    if collection.find_one({"_id": marker}):
+    previous = collection.find_one({"_id": marker})
+    if previous and previous.get("status") != "running":
         return
-    report = {"_id": marker, "mode": mode, "started_at": int(time.time()), "status": "running", "pages": [], "accounts": {}}
-    collection.insert_one(report)
-    print("[ZEUS_VALIDATION] " + json.dumps({"run": marker, "event": "started"}), flush=True)
+    if previous:
+        # One Railway replica: allow the draining predecessor to stop, then
+        # resume only unfinished pages after a release/restart.
+        time.sleep(20)
+        previous = collection.find_one({"_id": marker})
+        if previous.get("status") != "running":
+            return
+        report = previous
+    else:
+        report = {"_id": marker, "mode": mode, "started_at": int(time.time()), "status": "running", "pages": [], "accounts": {}}
+        collection.insert_one(report)
+    print("[ZEUS_VALIDATION] " + json.dumps({"run": marker, "event": "resumed" if previous else "started", "completed_pages": len(report["pages"])}), flush=True)
     try:
         config = get_processing_config()
         for provider, configured in (("gpt", bool(config.chatgpt_access_token)), ("gemini", bool(config.gemini_cookie_header))):
@@ -90,10 +102,16 @@ def run_validation(api, marker, folder, mode="full"):
             text = extract_page(output.getvalue(), "3-small-numeric-ui.png", candidate)
             expected = "22106649亿5999万9075"
             report["fine_numeric_check"] = {"expected": expected, "found": normalized(expected) in normalized(text), "text": text}
+            line = "ZEUS_FILE_VALIDATION_" + uuid.uuid4().hex
+            answer = complete_external("gpt", "Read the attached text file and return its one line exactly.",
+                                       files=[((line + "\n").encode(), "zeus-validation.txt")], config=candidate)
+            report["file_attachment_check"] = {"found": line in answer, "output": answer}
             report["same_conversation"] = provider_thread("gpt").get("conversation_id") == conversation
             report["status"] = "completed"
             return
         for data, name in images:
+            if any(page["name"] == name for page in report["pages"]):
+                continue
             started = time.monotonic()
             def progress(stage, page, current=0, total=0, label=""):
                 print("[ZEUS_VALIDATION_REGION] " + json.dumps({"page": page, "region": current, "total": total}), flush=True)
@@ -126,7 +144,7 @@ def run_validation(api, marker, folder, mode="full"):
         report["status"] = "completed"
     except Exception as exc:
         report["status"] = "failed"
-        report["error"] = api.sanitize_error(exc)
+        report["error"] = "تعذر الاتصال بخادم الملفات." if isinstance(exc, requests.RequestException) else api.sanitize_error(exc)
         cause = exc.__cause__
         if cause is not None and "HTTP " in str(cause):
             report["server_error"] = api.sanitize_error(cause)
