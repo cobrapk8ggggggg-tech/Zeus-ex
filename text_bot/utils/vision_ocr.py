@@ -126,7 +126,7 @@ def reconcile_audit(first, audited):
     return sorted(result, key=lambda r: (r["box"][1], r["box"][0]))
 
 
-def refine_small_regions(crop, regions, config, budget=None, numeric_reserve=None):
+def refine_small_regions(crop, regions, config, budget=None, numeric_reserve=None, diagnostics=None):
     """Give difficult text its own enlarged image instead of guessing it."""
     with Image.open(io.BytesIO(crop.data)) as image:
         image = image.convert("RGB")
@@ -153,6 +153,10 @@ def refine_small_regions(crop, regions, config, budget=None, numeric_reserve=Non
         output = io.BytesIO()
         focus.save(output, format="PNG")
         focused = Crop(output.getvalue(), crop.name + ".detail.png", 0, focus.height, 0, focus.height, focus.width)
+        if diagnostics:
+            diagnostics({"event": "detail", "page": crop.name, "numeric": numeric_ui,
+                         "characters": len(item["text"]), "source_box": item["box"],
+                         "pixel_bounds": [left, top, right, bottom], "output_size": list(focus.size)})
         try:
             prompt = transcription_prompt(focused, config.ocr_scope)
             prompt += "\nThis is a magnified source region. Read tiny status/UI text row by row. One row per record. Copy visible glyphs only; do not guess illegible letters. Check long numbers digit by digit against THIS image; never reuse a number from previous messages."
@@ -195,7 +199,7 @@ def refine_small_regions(crop, regions, config, budget=None, numeric_reserve=Non
     return result
 
 
-def extract_page(data, name, config, *, bubble_spacing=True, progress=None):
+def extract_page(data, name, config, *, bubble_spacing=True, progress=None, diagnostics=None):
     crops = make_crops(data, name, config.ocr_crop_height)
     records = []
     rescue_budget = [config.ocr_rescue_limit]
@@ -221,7 +225,7 @@ def extract_page(data, name, config, *, bubble_spacing=True, progress=None):
                 # owned by an adjacent crop, or repeatedly rescue the same edge.
                 scale = (crop.bottom - crop.top) / 1000
                 owned = [r for r in regions if crop.core_top <= crop.top + (r["box"][1] + r["box"][3]) / 2 * scale < crop.core_bottom]
-                regions = refine_small_regions(crop, owned, config, rescue_budget, numeric_reserve)
+                regions = refine_small_regions(crop, owned, config, rescue_budget, numeric_reserve, diagnostics)
                 error = None
                 break
             except Exception as exc:

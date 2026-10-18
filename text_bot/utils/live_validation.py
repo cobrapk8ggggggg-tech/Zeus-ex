@@ -96,12 +96,15 @@ def run_validation(api, marker, folder, mode="full"):
         conversation = initial
         report["same_conversation"] = True
         if mode == "focused":
+            def diagnostics(detail):
+                report.setdefault("diagnostics", []).append(detail)
+                print("[ZEUS_VALIDATION_DETAIL] " + json.dumps(detail), flush=True)
             data = next(data for data, name in images if name == "3.jpg")
             with Image.open(io.BytesIO(data)) as image:
                 crop = image.crop((0, max(0, image.height - 800), image.width, image.height))
                 output = io.BytesIO()
                 crop.save(output, format="PNG")
-            text = extract_page(output.getvalue(), "3-small-numeric-ui.png", candidate)
+            text = extract_page(output.getvalue(), "3-small-numeric-ui.png", candidate, diagnostics=diagnostics)
             expected = "22106649亿5999万9075"
             report["fine_numeric_check"] = {"expected": expected, "found": normalized(expected) in normalized(text), "text": text}
             line = "ZEUS_FILE_VALIDATION_" + uuid.uuid4().hex
