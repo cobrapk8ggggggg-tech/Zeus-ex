@@ -303,7 +303,16 @@ class ProviderConsole(discord.ui.LayoutView):
 
     async def edit_panel(self, interaction, view):
         kwargs = dict(content=None, embeds=[], attachments=[], view=view)
-        if self.message is not None:
+        if getattr(interaction, "message", None) is not None:
+            # Every component/modal was deferred as a message UPDATE. Use its
+            # fresh webhook token so an old /zx token cannot break later clicks.
+            message = await interaction.edit_original_response(**kwargs)
+            self.message = message
+            if isinstance(view, ProviderConsole):
+                view.message = message
+            elif isinstance(view, RecordPicker):
+                view.console.message = message
+        elif self.message is not None:
             await self.message.edit(**kwargs)
         else:
             # Compatibility with an already-open panel from an older deployment.

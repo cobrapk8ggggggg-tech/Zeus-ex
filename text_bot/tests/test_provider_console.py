@@ -204,3 +204,21 @@ class CookieImportTests(unittest.TestCase):
             load.return_value={"gemini_cookie_import":marker,"gemini_cookie_header":"SID=later-upload"}
             import_owner_cookie_file()
         db.bot_settings.update_one.assert_called_once()
+
+class ExpiredAnchorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_component_refresh_uses_its_new_token_and_keeps_the_same_message_id(self):
+        old=SimpleNamespace(id=8123,edit=AsyncMock(side_effect=RuntimeError("old token expired")))
+        current=SimpleNamespace(id=8123,edit=AsyncMock())
+        panel=ProviderConsole(bot,ProcessingConfig(provider="dark"),message=old)
+        interaction=SimpleNamespace(user=SimpleNamespace(id=bot.OWNER_ID),message=SimpleNamespace(id=8123),
+            response=SimpleNamespace(defer=AsyncMock()),edit_original_response=AsyncMock(return_value=current),
+            followup=SimpleNamespace(send=AsyncMock()))
+        with patch("utils.provider_admin.get_processing_config",return_value=panel.config), \
+             patch("utils.provider_admin.provider_thread",return_value={}):
+            await panel.action(interaction,"refresh")
+        interaction.response.defer.assert_awaited_once_with()
+        interaction.edit_original_response.assert_awaited_once()
+        new_view=interaction.edit_original_response.call_args.kwargs["view"]
+        self.assertEqual(new_view.message.id,8123)
+        old.edit.assert_not_awaited()
+        interaction.followup.send.assert_not_awaited()
