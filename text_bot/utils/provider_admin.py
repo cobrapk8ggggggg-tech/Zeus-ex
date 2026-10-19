@@ -81,7 +81,7 @@ class RecordPicker(discord.ui.LayoutView):
     async def selected(self, interaction):
         if not await guard(self.console.api, interaction):
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer()
         try:
             record = self.records[int(interaction.data["values"][0])]
             if self.action == "models":
@@ -106,6 +106,7 @@ class RecordPicker(discord.ui.LayoutView):
             elif self.action == "deepseek_chats":
                 await asyncio.to_thread(choose_thread, "deepseek", record)
             await self.console.refresh(interaction)
+            await interaction.followup.send("تم تطبيق الاختيار وتحديث اللوحة.", ephemeral=True)
         except Exception:
             await interaction.followup.send("تعذر تطبيق الاختيار. تحقق من الجلسة ثم حاول مجددًا.", ephemeral=True)
 
@@ -134,7 +135,7 @@ class TextModal(discord.ui.Modal):
     async def on_submit(self, interaction):
         if not await guard(self.console.api, interaction):
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer()
         try:
             config = await asyncio.to_thread(get_processing_config)
             value = self.value.value.strip()
@@ -191,16 +192,21 @@ class TextModal(discord.ui.Modal):
                 _PENDING[self.console.provider].clear()
                 await interaction.followup.send("نتيجة الطلب:", file=discord.File(io.BytesIO(answer.encode()), filename="response.txt"), ephemeral=True)
             await self.console.refresh(interaction)
+            if self.action not in ("message", "urls"):
+                await interaction.followup.send("تم حفظ الإعداد وتحديث اللوحة.", ephemeral=True)
         except Exception:
             await interaction.followup.send("تعذر تنفيذ الطلب. تحقق من البيانات والجلسة. لم يتم عرض بيانات الاتصال.", ephemeral=True)
 
 
 class ProviderConsole(discord.ui.LayoutView):
-    def __init__(self, api, config, state=None, provider=None):
+    def __init__(self, api, config, state=None, provider=None, message=None):
         super().__init__(timeout=900)
         self.api, self.config = api, config
         self.provider = provider or config.provider
         self.state = state or {}
+        # Keep the original followup WebhookMessage, including for modal submits.
+        # An ephemeral channel Message cannot be edited through the bot API.
+        self.message = message
         self.build()
 
     async def interaction_check(self, interaction):
@@ -257,7 +263,7 @@ class ProviderConsole(discord.ui.LayoutView):
             self.text(box, f"## {{emoji:shieldcheck}} الجلسة والنموذج\nالجلسة: **{'محفوظة' if has_session else 'غير مضافة بعد'}** · النموذج: `{safe(model)}`\n"
                           f"{project_line}"
                           f"المحادثة: **{safe(title or ('المحادثة المحفوظة' if cid else 'جديدة عند أول رسالة'))}**\n"
-                          f"المعرّف: `{safe(cid)}`\nالمرفقات الجاهزة للرسالة التالية: `{len(_PENDING[self.provider])}`\n-# كل الصور والأجزاء تتابع هذه المحادثة. لا تتغير تلقائيًا ولا تُحذف بعد الاستخراج.")
+                          f"المعرّف: `{safe(cid)}`\nالمرفقات الجاهزة للرسالة التالية: `{len(_PENDING[self.provider])}`\n-# الصور تتابع المحادثة نفسها. عند فشل صورة: محادثة جديدة في المشروع نفسه، ثم مزود احتياطي إذا لزم.")
             if self.provider == "gpt":
                 actions = [("معلومات الحساب والتوكن", "account", "infocircle"), ("تحديث التوكن", "token", "lock"),
                            ("نماذج الحساب", "models", "adjustments"), ("تحديد نموذج يدويًا", "model", "adjustments"), ("مشاريع الحساب", "projects", "folderopen"),
@@ -267,7 +273,7 @@ class ProviderConsole(discord.ui.LayoutView):
                 actions = [("فحص جلسة DeepSeek", "account", "shieldcheck"), ("تحديث توكن DeepSeek", "deepseek_token", "lock"),
                            ("نماذج الخدمة", "models", "adjustments"), ("تحديد نموذج يدويًا", "model", "adjustments"),
                            ("المحادثات المحفوظة", "chats", "message"),
-                           (f"التفكير: {'مفعّل' if self.config.deepseek_thinking else 'معطّل'}", "thinking", "adjustments")]
+                           (f"تفكير التجربة: {'مفعّل' if self.config.deepseek_thinking else 'معطّل'}", "thinking", "adjustments")]
             else:
                 self.text(box, "-# النموذج adaptive وحساب Google رقم 1 هما المثبتان في الملف المرفق. قائمة المحادثات هنا تعرض ما حُفظ بهذا البوت أو استوردته بملف حالة.")
                 actions = [("رفع ملف الكوكيز", "cookies", "folderopen"), ("فحص الاتصال", "account", "shieldcheck"),
@@ -282,7 +288,8 @@ class ProviderConsole(discord.ui.LayoutView):
             self.text(box, "## {emoji:photo} سياسة الصور\nحتى 16000 بكسل: الصورة كاملة كما هي.\n"
                           "فوق 16000 بكسل: ثلاثة أجزاء فقط، تُرسل معًا في طلب واحد مرتب.\n"
                           "طلب استخراج واحد عند النجاح؛ إعادة المحاولة تكون عند الفشل فقط.\n"
-                          f"النطاق: **{'كل النصوص بما فيها مربعات الحالة والأصوات' if self.config.ocr_scope == 'all' else 'الحوار والسرد ومربعات الحالة بدون الأصوات'}**\n"
+                          f"النطاق الافتراضي للتجربة: **{'كل النصوص بما فيها الأصوات' if self.config.ocr_scope == 'all' else 'الحوار والسرد ومربعات الحالة بدون الأصوات'}**\n"
+                          "استخراج المستخدم يطبّق خيار المؤثرات والترجمة واللغة من /setting.\n"
                           "حفظ اللغة والحروف الأصلية • ترتيب رأسي • إزالة تكرار التداخل فقط")
             self.buttons(box, [("نطاق النصوص", "scope", "list"), ("نتيجة آخر اختبار", "report", "chartpie")])
         self.buttons(box, [("تفعيل هذا المزود", "activate", "circlecheck"), ("تحديث اللوحة", "refresh", "clock"), ("المستخدمون والنقاط", "users", "user")])
@@ -291,9 +298,16 @@ class ProviderConsole(discord.ui.LayoutView):
     async def refresh(self, interaction):
         config = await asyncio.to_thread(get_processing_config)
         state = await asyncio.to_thread(provider_thread, self.provider) if self.provider != "qwen" else {}
-        view = ProviderConsole(self.api, config, state, self.provider)
-        # This message is always an ephemeral /zx response.
-        await interaction.edit_original_response(content=None, embeds=[], attachments=[], view=view)
+        view = ProviderConsole(self.api, config, state, self.provider, self.message)
+        await self.edit_panel(interaction, view)
+
+    async def edit_panel(self, interaction, view):
+        kwargs = dict(content=None, embeds=[], attachments=[], view=view)
+        if self.message is not None:
+            await self.message.edit(**kwargs)
+        else:
+            # Compatibility with an already-open panel from an older deployment.
+            await interaction.edit_original_response(**kwargs)
 
     async def provider_selected(self, interaction):
         if not await guard(self.api, interaction):
@@ -306,7 +320,7 @@ class ProviderConsole(discord.ui.LayoutView):
         if not records:
             await interaction.followup.send("لا توجد عناصر في هذا القسم للحساب الحالي.", ephemeral=True)
             return
-        await interaction.edit_original_response(content=None, embeds=[], attachments=[], view=RecordPicker(self, records, action))
+        await self.edit_panel(interaction, RecordPicker(self, records, action))
 
     async def action(self, interaction, action):
         if not await guard(self.api, interaction):
@@ -314,7 +328,7 @@ class ProviderConsole(discord.ui.LayoutView):
         if action in ("token", "deepseek_token", "system_prompt", "urls", "message", "open_chat", "model"):
             await interaction.response.send_modal(TextModal(self, action))
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer()
         try:
             config = await asyncio.to_thread(get_processing_config)
             candidate = replace(config, provider=self.provider)
@@ -322,7 +336,14 @@ class ProviderConsole(discord.ui.LayoutView):
                 await asyncio.to_thread(validate_provider, {"_processing_config": candidate})
                 await asyncio.to_thread(save_processing_config, provider=self.provider)
             elif action in ("new", "ordinary"):
-                await asyncio.to_thread(new_thread, self.provider, ordinary=action == "ordinary")
+                from utils.providers import PROVIDER_LOCKS
+                def create():
+                    with PROVIDER_LOCKS[self.provider]:
+                        new_thread(self.provider, ordinary=action == "ordinary", config=candidate)
+                        complete_external(self.provider,
+                            "This is a new OCR workspace. Future images must be transcribed verbatim in original language and reading order. Reply READY only.",
+                            config=candidate, max_attempts=1)
+                await asyncio.to_thread(create)
                 _PENDING[self.provider].clear()
             elif action == "clear":
                 _PENDING[self.provider].clear()
@@ -375,26 +396,33 @@ class ProviderConsole(discord.ui.LayoutView):
                 accounts = data["accounts"]
                 await interaction.followup.send(embed=self.api.themed_embed("حالة Qwen", f"الحسابات: {len(accounts)}\nالنشطة: {sum(a.get('ocr_limit_until', 0) <= time.time() for a in accounts)}\nالاستخدامات: {sum(a.get('ocr_count', 0) for a in accounts)}"), ephemeral=True)
             await self.refresh(interaction)
+            receipts = {"activate": f"تم تفعيل {PROVIDER_LABELS[self.provider]} وتحديث اللوحة.",
+                        "new": "تم إنشاء محادثة جديدة وتحديث معرّفها في اللوحة، مع الاحتفاظ بالمشروع إن كان مختارًا.",
+                        "ordinary": "تم إنشاء محادثة جديدة خارج المشاريع وتحديث اللوحة.",
+                        "clear": "تم مسح المرفقات المعلّقة.",
+                        "thinking": "تم تحديث تفكير الرسالة التجريبية. /extract يطبّق الوضع الذي يختاره المستخدم.",
+                        "scope": "تم تحديث نطاق التجربة. استخراج المستخدم يطبّق إعداد المؤثرات من /setting."}
+            if action in receipts:
+                await interaction.followup.send(receipts[action], ephemeral=True)
         except Exception:
-            await interaction.followup.send("تعذر إكمال الإجراء. تحقق من الجلسة والاتصال. لم تُغيّر المحادثة تلقائيًا.", ephemeral=True)
+            await self.refresh(interaction)
+            await interaction.followup.send("تعذر إكمال الإجراء. تحقق من الجلسة والاتصال ثم حاول مجددًا.", ephemeral=True)
 
     async def receive_file(self, interaction, action, config):
         provider = config.provider
-        # All uploads use the same owner DM. One waiter prevents a cookie file
-        # being consumed by a simultaneous attachment-upload action.
+        # Accept the attachment in the same channel where /zx was opened.
         key = self.api.OWNER_ID
         if key in _UPLOADS:
-            await interaction.followup.send("يوجد انتظار ملف قائم بالفعل؛ أرسل الملف في الخاص أو انتظر انتهاء المهلة.", ephemeral=True)
+            await interaction.followup.send("يوجد انتظار ملف قائم بالفعل في دردشة أخرى أو في هذه الدردشة؛ أكمله أو أرسل إلغاء.", ephemeral=True)
             return
         _UPLOADS.add(key)
         try:
-            dm = await interaction.user.create_dm()
+            channel_id = interaction.channel.id
             instructions = {"cookies": "أرسل ملف كوكيز Google (.txt أو .json أو Netscape)، بحد أقصى 2 MB.",
                             "import_thread": "أرسل ملف حالة Gemini JSON وفيه conversation_id وresponse_id وchoice_id وat_token.",
                             "attachment": "أرسل صورة أو ملفًا. مع تعليق: يُرسل السؤال فورًا في المحادثة المحددة. بدون تعليق: يُحفظ المرفق للرسالة التجريبية التالية."}
-            await dm.send(instructions[action] + "\nالمهلة: خمس دقائق. أرسل إلغاء لإيقاف الانتظار.")
-            await interaction.followup.send("أرسلت لك تعليمات الرفع في الخاص. أنتظر الملف هناك فقط لمدة خمس دقائق.", ephemeral=True)
-            message = await self.api.bot.wait_for("message", timeout=300, check=lambda m: m.author.id == self.api.OWNER_ID and m.channel.id == dm.id and (m.attachments or (m.content or "").strip() == "إلغاء"))
+            await interaction.followup.send(instructions[action] + "\nأرسل الملف هنا في هذه الدردشة. المهلة: خمس دقائق. أرسل إلغاء لإيقاف الانتظار.", ephemeral=True)
+            message = await self.api.bot.wait_for("message", timeout=300, check=lambda m: m.author.id == self.api.OWNER_ID and m.channel.id == channel_id and (m.attachments or (m.content or "").strip() == "إلغاء"))
             if not message.attachments:
                 await interaction.followup.send("تم إلغاء انتظار الملف.", ephemeral=True)
                 return
@@ -406,7 +434,7 @@ class ProviderConsole(discord.ui.LayoutView):
             if action == "cookies":
                 header = parse_cookie_file(data)
                 await asyncio.to_thread(save_processing_config, gemini_cookie_header=header)
-                await dm.send("تم حفظ ملف الكوكيز. يمكنك حذف رسالة الملف الآن. افحص الاتصال من /zx.")
+                await interaction.followup.send("تم حفظ كوكيز Gemini من الملف وتحديث الجلسة. افحص الاتصال من اللوحة.", ephemeral=True)
             elif action == "import_thread":
                 state = json.loads(data.decode("utf-8-sig"))
                 if not isinstance(state, dict) or not all(isinstance(state.get(k), str) and state[k] for k in ("conversation_id", "response_id", "choice_id")):
@@ -414,6 +442,7 @@ class ProviderConsole(discord.ui.LayoutView):
                 clean = {k: state.get(k, "") for k in ("conversation_id", "response_id", "choice_id", "at_token")}
                 clean["title"] = "محادثة Gemini مستوردة"
                 await asyncio.to_thread(choose_thread, "gemini", clean)
+                await interaction.followup.send("تم استيراد المحادثة وتحديث اللوحة.", ephemeral=True)
             else:
                 is_image = (attachment.content_type or "").startswith("image/") or attachment.filename.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif"))
                 prompt = (message.content or "").strip()
@@ -422,14 +451,12 @@ class ProviderConsole(discord.ui.LayoutView):
                         raise ValueError("عدد المرفقات تجاوز الحد المسموح")
                     _PENDING[provider].append((data, attachment.filename, is_image))
                     button_label = "طلب نصي" if provider == "dark" else "رسالة تجريبية"
-                    await dm.send(f"أضيف المرفق. أرسل سؤالك من زر {button_label} في /zx، أو امسح المرفقات من اللوحة.")
+                    await interaction.followup.send(f"أضيف المرفق. أرسل سؤالك من زر {button_label} في /zx، أو امسح المرفقات من اللوحة.", ephemeral=True)
                     return
                 answer = await asyncio.to_thread(complete_external, provider, prompt,
                     [(data, attachment.filename)] if is_image else (), files=() if is_image else [(data, attachment.filename)], config=config)
                 await interaction.followup.send(file=discord.File(io.BytesIO(answer.encode()), filename="attachment-response.txt"), ephemeral=True)
         except asyncio.TimeoutError:
             await interaction.followup.send("انتهت مهلة رفع الملف. يمكنك بدء الرفع مجددًا من اللوحة.", ephemeral=True)
-        except discord.Forbidden:
-            await interaction.followup.send("تعذر فتح الخاص. اسمح برسائل البوت الخاصة ثم أعد محاولة الرفع؛ لا ترسل الكوكيز في قناة عامة.", ephemeral=True)
         finally:
             _UPLOADS.discard(key)

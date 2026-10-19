@@ -63,6 +63,23 @@ def get_processing_config():
     )
 
 
+def import_owner_cookie_file():
+    """One-time import of the cookie export supplied by the owner for this repair."""
+    import hashlib
+    from utils.storage import save_processing_config
+    marker = os.getenv("ZEUS_IMPORT_GEMINI_COOKIES", "")
+    header = os.getenv("GEMINI_COOKIE_HEADER", "")
+    if not marker or not header:
+        return
+    saved = load_processing_config()
+    if saved.get("gemini_cookie_import") == marker:
+        return
+    clean = parse_cookie_file(header.encode())
+    if hashlib.sha256(clean.encode()).hexdigest() != marker:
+        raise ProviderConfigurationError("ملف استيراد الكوكيز غير متطابق.")
+    save_processing_config(gemini_cookie_header=clean, gemini_cookie_import=marker)
+
+
 def processing_config(settings=None):
     config = (settings or {}).get("_processing_config")
     return config if isinstance(config, ProcessingConfig) else get_processing_config()
@@ -81,6 +98,11 @@ def selected_provider(settings=None):
     if value not in PROVIDER_LABELS:
         raise ProviderConfigurationError("إعداد المعالجة غير صالح. يرجى التواصل مع إدارة البوت.")
     return value
+
+
+def supports_thinking(provider):
+    # Only these supplied protocols expose a real thinking switch.
+    return provider in ("qwen", "deepseek")
 
 
 def _gemini_cookies(config=None):
@@ -125,9 +147,10 @@ def parse_cookie_file(data):
             if len(parts) >= 7 and (parts[0].lstrip(".") == "google.com" or parts[0].endswith(".google.com")):
                 pairs.append((parts[5], parts[6]))
     else:
-        if text.startswith("export "):
+        if re.search(r"(?m)^\s*(?:export\s+)?(?:BROWSER_COOKIE_HEADER|GEMINI_COOKIE_HEADER)=", text):
             try:
-                tokens = shlex.split(text)
+                # Parse shell quoting as data. Never execute an exported file.
+                tokens = shlex.split(text, comments=True)
                 text = next(item.split("=", 1)[1] for item in tokens if item.startswith(("BROWSER_COOKIE_HEADER=", "GEMINI_COOKIE_HEADER=")))
             except (ValueError, StopIteration):
                 raise ProviderConfigurationError("ملف ترويسة الكوكيز غير صالح.") from None
@@ -195,13 +218,13 @@ def choose_thread(provider, state):
         select_provider_thread(provider, state)
 
 
-def new_thread(provider, *, ordinary=False):
+def new_thread(provider, *, ordinary=False, config=None):
     with PROVIDER_LOCKS[provider]:
         old = provider_thread(provider)
         state = {k: old[k] for k in ("gizmo_id", "project_name") if k in old} if provider == "gpt" and not ordinary else {}
         state["title"] = "محادثة جديدة"
         if provider == "gpt":
-            state["account_id"] = _chatgpt_credentials(get_processing_config())[1]
+            state["account_id"] = _chatgpt_credentials(config or get_processing_config())[1]
         select_provider_thread(provider, state)
 
 
@@ -660,7 +683,7 @@ class DeepSeekClient:
             self.state["parent_message_id"] = result["parent_message_id"]
         return result.get("response") or ""
 
-def complete_external(provider, prompt, images=(), *, max_attempts=2, thinking_enabled=False, config=None, files=(), file_urls=()):
+def complete_external(provider, prompt, images=(), *, max_attempts=2, thinking_enabled=None, config=None, files=(), file_urls=()):
     if provider not in PROVIDER_LOCKS:
         raise ProviderConfigurationError("إعداد المعالجة غير صالح. يرجى التواصل مع إدارة البوت.")
     config = config or ProcessingConfig(
@@ -688,7 +711,7 @@ def complete_external(provider, prompt, images=(), *, max_attempts=2, thinking_e
         return _complete_persistent(provider, prompt, images, files, config, max_attempts, thinking_enabled)
 
 
-def _complete_persistent(provider, prompt, images, files, config, max_attempts, thinking_enabled=False):
+def _complete_persistent(provider, prompt, images, files, config, max_attempts, thinking_enabled=None):
     document = load_provider_thread(provider)
     state, revision = document.get("state") or {}, document.get("revision", 0)
     if provider == "gpt":
@@ -705,7 +728,7 @@ def _complete_persistent(provider, prompt, images, files, config, max_attempts, 
     for attempt in range(max(1, max_attempts)):
         client = GeminiClient(config) if provider == "gemini" else DeepSeekClient(config) if provider == "deepseek" else ChatGPTClient(config)
         if provider == "deepseek":
-            client.thinking_enabled = thinking_enabled or config.deepseek_thinking
+            client.thinking_enabled = config.deepseek_thinking if thinking_enabled is None else bool(thinking_enabled)
         client.state = dict(state)
         try:
             answer = client.complete(prompt, images, files).strip()

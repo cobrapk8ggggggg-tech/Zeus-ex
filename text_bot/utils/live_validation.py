@@ -222,7 +222,7 @@ def run_batch_validation(api, marker):
     print("[ZEUS_BATCH] " + json.dumps({"run": marker, "event": "started", "policy": report["policy"]}), flush=True)
     try:
         for provider, configured in (("gpt", bool(config.chatgpt_access_token)),
-                                     ("dark", True), ("deepseek", bool(config.deepseek_token))):
+                                     ("gemini", bool(config.gemini_cookie_header)), ("dark", True), ("deepseek", bool(config.deepseek_token))):
             if not configured:
                 report.setdefault("skipped", []).append(provider)
                 continue
@@ -239,7 +239,7 @@ def run_batch_validation(api, marker):
                 started = time.monotonic()
                 row = {"name": name, "provider": provider, "expected_attachments": count}
                 try:
-                    text = extract_page(data, name, candidate, diagnostics=diagnostics)
+                    text = extract_page(data, name, candidate, diagnostics=diagnostics, response_observer=lambda raw: row.update(raw=raw))
                     row.update(text=text, correct_text_and_order=evaluate(text),
                                requests=len(calls), attachments=[c["attachments"] for c in calls])
                     row["passed"] = row["correct_text_and_order"] and len(calls) == 1 and calls[0]["attachments"] == count
@@ -252,7 +252,9 @@ def run_batch_validation(api, marker):
                 row["seconds"] = round(time.monotonic() - started, 1)
                 report["pages"].append(row)
                 save()
-                print("[ZEUS_BATCH] " + json.dumps({k: v for k, v in row.items() if k != "text"}, ensure_ascii=False), flush=True)
+                if provider == "dark" and "raw" in row:
+                    print("[ZEUS_DARK_FIXTURE] " + json.dumps({"page": name, "response": row["raw"]}, ensure_ascii=False), flush=True)
+                print("[ZEUS_BATCH] " + json.dumps({k: v for k, v in row.items() if k not in ("text", "raw")}, ensure_ascii=False), flush=True)
         if "url_lifecycle" not in report:
             candidate = replace(config, provider="dark")
             with temporary_links([(small, "fixture.png")]) as urls:
@@ -282,6 +284,6 @@ def run_batch_validation(api, marker):
         save()
         print("[ZEUS_BATCH_RESULT] " + json.dumps({
             **{k: v for k, v in report.items() if k not in ("pages", "_id", "pdf_attachment")},
-            "pages": [{k: v for k, v in page.items() if k != "text"} for page in report["pages"]],
+            "pages": [{k: v for k, v in page.items() if k not in ("text", "raw")} for page in report["pages"]],
             "pdf_attachment": {"passed": report.get("pdf_attachment", {}).get("passed")}
         }, ensure_ascii=False), flush=True)

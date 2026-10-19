@@ -26,11 +26,11 @@ class ConsoleTests(unittest.IsolatedAsyncioTestCase):
         config = ProcessingConfig(provider="gpt")
         panel = ProviderConsole(bot, config)
         panel.refresh = AsyncMock()
-        interaction = SimpleNamespace(user=SimpleNamespace(id=bot.OWNER_ID), response=SimpleNamespace(defer=AsyncMock()))
+        interaction = SimpleNamespace(user=SimpleNamespace(id=bot.OWNER_ID), response=SimpleNamespace(defer=AsyncMock()), followup=SimpleNamespace(send=AsyncMock()))
         with patch("utils.provider_admin.get_processing_config", return_value=config), patch("utils.provider_admin.validate_provider"), patch("utils.provider_admin.save_processing_config") as save:
             await panel.action(interaction, "activate")
         save.assert_called_once_with(provider="gpt")
-        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        interaction.response.defer.assert_awaited_once_with()
 
     async def test_nonowner_cannot_change_provider_or_submit_token(self):
         panel = ProviderConsole(bot, ProcessingConfig())
@@ -41,18 +41,19 @@ class ConsoleTests(unittest.IsolatedAsyncioTestCase):
         save.assert_not_called()
         self.assertTrue(interaction.response.send_message.call_args.kwargs["ephemeral"])
 
-    async def test_cookie_upload_is_owner_dm_only_and_accepts_more_than_4000_characters(self):
+    async def test_cookie_upload_stays_in_same_channel_and_accepts_more_than_4000_characters(self):
         panel = ProviderConsole(bot, ProcessingConfig(provider="gemini"))
         raw = b"SID=" + b"a" * 9000
         attachment = SimpleNamespace(size=len(raw), read=AsyncMock(return_value=raw), filename="cookies.txt")
-        dm = SimpleNamespace(id=1234, send=AsyncMock())
-        message = SimpleNamespace(author=SimpleNamespace(id=bot.OWNER_ID), channel=dm, content="", attachments=[attachment])
-        interaction = SimpleNamespace(user=SimpleNamespace(id=bot.OWNER_ID, create_dm=AsyncMock(return_value=dm)), followup=SimpleNamespace(send=AsyncMock()))
+        channel = SimpleNamespace(id=1234)
+        message = SimpleNamespace(author=SimpleNamespace(id=bot.OWNER_ID), channel=channel, content="", attachments=[attachment])
+        interaction = SimpleNamespace(channel=channel, user=SimpleNamespace(id=bot.OWNER_ID, create_dm=AsyncMock()), followup=SimpleNamespace(send=AsyncMock()))
         with patch.object(bot.bot, "wait_for", new_callable=AsyncMock, return_value=message) as wait, patch("utils.provider_admin.save_processing_config") as save:
             await panel.receive_file(interaction, "cookies", panel.config)
+        interaction.user.create_dm.assert_not_awaited()
         check = wait.call_args.kwargs["check"]
         self.assertTrue(check(message))
-        self.assertFalse(check(SimpleNamespace(author=SimpleNamespace(id=1), channel=dm, content="", attachments=[attachment])))
+        self.assertFalse(check(SimpleNamespace(author=SimpleNamespace(id=1), channel=channel, content="", attachments=[attachment])))
         self.assertFalse(check(SimpleNamespace(author=message.author, channel=SimpleNamespace(id=999), content="", attachments=[attachment])))
         self.assertEqual(len(save.call_args.kwargs["gemini_cookie_header"]), len(raw))
         self.assertNotIn("a" * 100, str(interaction.followup.send.call_args_list))
@@ -81,7 +82,7 @@ class ConsoleTests(unittest.IsolatedAsyncioTestCase):
         panel.refresh = AsyncMock()
         picker = RecordPicker(panel, [{"slug": "deepseek-chat", "title": "Chat"}], "models")
         interaction = SimpleNamespace(user=SimpleNamespace(id=bot.OWNER_ID), data={"values": ["0"]},
-                                      response=SimpleNamespace(defer=AsyncMock()))
+                                      response=SimpleNamespace(defer=AsyncMock()), followup=SimpleNamespace(send=AsyncMock()))
         with patch("utils.provider_admin.save_processing_config") as save:
             await picker.selected(interaction)
         save.assert_called_once_with(deepseek_model="deepseek-chat")
@@ -114,9 +115,72 @@ class CookieTests(unittest.TestCase):
     def test_raw_header_json_netscape_and_export_formats(self):
         samples = [b"Cookie: SID=a=b; HSID=two", b'[{"domain":".google.com","name":"SID","value":"a=b"}]',
                    b"# Netscape HTTP Cookie File\n#HttpOnly_.google.com\tTRUE\t/\tTRUE\t0\tSID\ta=b",
-                   b"export BROWSER_COOKIE_HEADER='SID=a=b; HSID=two'"]
+                   b"export BROWSER_COOKIE_HEADER='SID=a=b; HSID=two'",
+                   b"#!/bin/sh\nexport COOKIE_SID='unused'\nexport BROWSER_COOKIE_HEADER='SID=a=b; __Secure-1PSID=two'\n"]
         for sample in samples:
             self.assertIn("SID=a=b", parse_cookie_file(sample))
 
     def test_json_filters_other_domains(self):
         self.assertEqual(parse_cookie_file(b'[{"domain":".google.com","name":"SID","value":"ok"},{"domain":"evil.test","name":"x","value":"secret"}]'), "SID=ok")
+
+
+class AnchorTests(unittest.IsolatedAsyncioTestCase):
+    def interaction(self):
+        return SimpleNamespace(user=SimpleNamespace(id=bot.OWNER_ID),
+            response=SimpleNamespace(defer=AsyncMock(), send_modal=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()), edit_original_response=AsyncMock())
+
+    async def test_actions_refresh_selection_and_modal_all_edit_one_original_message(self):
+        anchor = SimpleNamespace(id=8123, edit=AsyncMock())
+        config = ProcessingConfig(provider="deepseek", deepseek_token="test")
+        panel = ProviderConsole(bot, config, message=anchor)
+        with patch("utils.provider_admin.get_processing_config", return_value=config), \
+             patch("utils.provider_admin.provider_thread", return_value={}), \
+             patch("utils.provider_admin.save_processing_config"), \
+             patch("utils.provider_admin.validate_provider"):
+            for action in ("activate", "thinking", "scope", "clear", "refresh"):
+                interaction = self.interaction()
+                await panel.action(interaction, action)
+                interaction.response.defer.assert_awaited_once_with()
+                interaction.edit_original_response.assert_not_awaited()
+                for call in interaction.followup.send.call_args_list:
+                    self.assertNotIn("view", call.kwargs)
+                self.assertIs(anchor.edit.call_args.kwargs["view"].message, anchor)
+            interaction = self.interaction()
+            interaction.data = {"values": ["gemini"]}
+            await panel.provider_selected(interaction)
+            self.assertEqual(anchor.edit.call_args.kwargs["view"].provider, "gemini")
+            modal = TextModal(panel, "model")
+            modal.value._value = "auto"
+            await modal.on_submit(self.interaction())
+            self.assertEqual(anchor.edit.await_count, 7)
+
+    async def test_picker_edits_the_anchor_and_back_keeps_it(self):
+        anchor = SimpleNamespace(edit=AsyncMock())
+        panel = ProviderConsole(bot, ProcessingConfig(provider="gpt"), message=anchor)
+        interaction = self.interaction()
+        await panel.picker(interaction, [{"slug": "auto", "title": "Auto"}], "models")
+        picker = anchor.edit.call_args.kwargs["view"]
+        self.assertIs(picker.console.message, anchor)
+        with patch("utils.provider_admin.get_processing_config", return_value=panel.config), \
+             patch("utils.provider_admin.provider_thread", return_value={}):
+            await picker.back(interaction)
+        self.assertIs(anchor.edit.call_args.kwargs["view"].message, anchor)
+        interaction.edit_original_response.assert_not_awaited()
+
+    async def test_new_chat_allocates_it_and_sends_only_a_receipt(self):
+        anchor = SimpleNamespace(edit=AsyncMock())
+        config = ProcessingConfig(provider="deepseek", deepseek_token="test")
+        panel = ProviderConsole(bot, config, message=anchor)
+        interaction = self.interaction()
+        with patch("utils.provider_admin.get_processing_config", return_value=config), \
+             patch("utils.provider_admin.provider_thread", return_value={"conversation_id": "new-id"}), \
+             patch("utils.provider_admin.new_thread") as new, \
+             patch("utils.provider_admin.complete_external", return_value="READY") as request:
+            await panel.action(interaction, "new")
+        new.assert_called_once_with("deepseek", ordinary=False, config=config)
+        request.assert_called_once()
+        self.assertEqual(anchor.edit.call_args.kwargs["view"].state["conversation_id"], "new-id")
+        interaction.followup.send.assert_awaited_once()
+        self.assertNotIn("view", interaction.followup.send.call_args.kwargs)
+        self.assertIn("تم إنشاء", interaction.followup.send.call_args.args[0])

@@ -354,5 +354,16 @@ class AdditionalProviderTests(unittest.TestCase):
             providers.complete_external("deepseek", "extract", config=config, max_attempts=1)
         self.assertNotIn(config.deepseek_token, str(caught.exception))
 
+class ThinkingSwitchTests(unittest.TestCase):
+    setUp = ProviderTests.setUp
+    @patch("utils.providers.requests.Session")
+    def test_explicit_fast_mode_overrides_owner_trial_thinking_default(self, factory):
+        config = providers.ProcessingConfig(provider="deepseek", deepseek_token="test", deepseek_thinking=True)
+        for enabled in (False, True, None):
+            factory.return_value.post.return_value = response(data={"session_id":"session", "parent_message_id":2, "response":"OK"})
+            providers.complete_external("deepseek", "prompt", config=config, thinking_enabled=enabled)
+            self.assertEqual(factory.return_value.post.call_args.kwargs["json"]["thinking_enabled"], enabled is not False)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -79,20 +79,75 @@ def transcription_prompt(crops, scope="all"):
     )
 
 
-def parse_regions(raw):
-    raw = re.sub(r"^\x60\x60\x60(?:json)?\s*|\s*\x60\x60\x60$", "", raw.strip(), flags=re.I)
-    try:
-        payload = json.loads(raw)
-    except ValueError:
-        raise RuntimeError("بنية رد الاستخراج غير مكتملة؛ ستعاد محاولة الطلب.") from None
-    regions = payload.get("regions") if isinstance(payload, dict) else None
+def unwrap_response(raw):
+    """Accept Markdown fences of any language and harmless JSON wrappers."""
+    text = str(raw or "").strip().lstrip("\ufeff")
+    match = re.fullmatch(r"```[^\n`]*\n([\s\S]*?)\n?```", text)
+    if match:
+        text = match.group(1).strip()
+    decoder = json.JSONDecoder()
+    for candidate in (text, *re.findall(r"```[^\n`]*\n([\s\S]*?)```", text)):
+        try:
+            payload = json.loads(candidate)
+        except ValueError:
+            if candidate.strip().startswith(("{", "[")):
+                raise RuntimeError("رد الاستخراج يحتوي JSON غير مكتمل.") from None
+            # Narrative around a complete JSON object is harmless; partial JSON is not.
+            payload = None
+            for start in re.finditer(r"[\[{]", candidate):
+                try:
+                    value, _ = decoder.raw_decode(candidate[start.start():])
+                    if isinstance(value, dict) and any(k in value for k in ("parts", "regions", "text")):
+                        payload = value
+                        break
+                except ValueError:
+                    pass
+            if payload is None:
+                continue
+        for _ in range(4):
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                    continue
+                except ValueError:
+                    return payload.strip()
+            if isinstance(payload, dict) and not any(k in payload for k in ("parts", "regions")):
+                wrapped = next((payload[k] for k in ("response", "content", "result", "text")
+                                if isinstance(payload.get(k), (str, dict, list))), None)
+                if wrapped is not None:
+                    if isinstance(wrapped, str):
+                        return unwrap_response(wrapped)
+                    payload = wrapped
+                    continue
+            break
+        return payload
+    if not text or text.startswith(("{", "[")):
+        raise RuntimeError("رد الاستخراج فارغ أو JSON غير مكتمل.")
+    if re.search(r"(?:I (?:cannot|can't|am unable)|unable to (?:read|view|access)|لا (?:أستطيع|يمكنني)|تعذر (?:عرض|قراءة))", text, re.I):
+        raise RuntimeError("لم يتمكن المزود من قراءة المرفق.")
+    return text
+
+
+def _clean_regions(payload):
+    if isinstance(payload, str):
+        regions = [{"text": line} for line in payload.splitlines() if line.strip()]
+    elif isinstance(payload, list):
+        regions = payload
+    else:
+        regions = payload.get("regions") if isinstance(payload, dict) else None
     if not isinstance(regions, list):
         raise RuntimeError("رد الاستخراج لا يحتوي قائمة المقاطع المطلوبة.")
     clean = []
-    for region in regions:
+    for index, region in enumerate(regions):
+        if isinstance(region, str):
+            region = {"text": region}
         if not isinstance(region, dict) or not isinstance(region.get("text"), str):
             raise RuntimeError("أحد مقاطع الاستخراج غير صالح.")
         box = region.get("box")
+        synthetic = box is None
+        if synthetic:
+            top = index * 1000 / max(1, len(regions))
+            box = [0, top, 1000, top + 500 / max(1, len(regions))]
         if not isinstance(box, list) or len(box) != 4 or any(
             isinstance(n, bool) or not isinstance(n, (float, int)) or not 0 <= n <= 1000 for n in box
         ) or box[2] <= box[0] or box[3] <= box[1]:
@@ -102,20 +157,27 @@ def parse_regions(raw):
         if not text and not region.get("illegible"):
             continue
         clean.append({"text": "⟦غير مقروء⟧" if marked or not text else text, "box": box,
-                      "kind": str(region.get("kind", "speech")), "illegible": bool(region.get("illegible")) or marked})
+                      "kind": str(region.get("kind", "speech")), "synthetic_box": synthetic,
+                      "illegible": bool(region.get("illegible")) or marked})
     return clean
 
 
+def parse_regions(raw):
+    return _clean_regions(unwrap_response(raw))
+
+
 def parse_parts(raw, count):
-    raw = re.sub(r"^\x60\x60\x60(?:json)?\s*|\s*\x60\x60\x60$", "", raw.strip(), flags=re.I)
-    try:
-        payload = json.loads(raw)
-    except ValueError:
-        raise RuntimeError("رد الأجزاء غير مكتمل.") from None
-    # Accept the old one-image shape without spending a retry on a harmless format difference.
-    if count == 1 and isinstance(payload, dict) and "regions" in payload:
-        return [parse_regions(json.dumps(payload, ensure_ascii=False))]
-    parts = payload.get("parts") if isinstance(payload, dict) else None
+    payload = unwrap_response(raw)
+    if count == 1 and (not isinstance(payload, dict) or "parts" not in payload):
+        return [_clean_regions(payload)]
+    if isinstance(payload, str):
+        # Plain fenced text is usable for batches only with every explicit part marker.
+        matches = list(re.finditer(r"(?im)^\s*(?:<<<|===|##?\s*)\s*(?:part|image)\s*(\d+)\s*(?:>>>|===|:)?\s*$", payload))
+        parts = [{"part": int(m.group(1)), "regions": [
+            line for line in payload[m.end():matches[i+1].start() if i+1 < len(matches) else len(payload)].splitlines() if line.strip()
+        ]} for i, m in enumerate(matches)]
+    else:
+        parts = payload.get("parts") if isinstance(payload, dict) else payload
     if not isinstance(parts, list) or len(parts) != count:
         raise RuntimeError("رد الاستخراج ناقص: يجب أن يحتوي كل أجزاء الصورة.")
     indexed = {}
@@ -125,7 +187,7 @@ def parse_parts(raw, count):
             number = int(number)
         if isinstance(number, bool) or not isinstance(number, int) or not 1 <= number <= count or number in indexed:
             raise RuntimeError("ترتيب أجزاء الرد غير صالح.")
-        indexed[number] = parse_regions(json.dumps(part, ensure_ascii=False))
+        indexed[number] = _clean_regions(part)
     return [indexed[i] for i in range(1, count + 1)]
 
 
@@ -135,33 +197,30 @@ def _overlap(a, b):
     return intersection / max(1, area)
 
 
-def extract_page(data, name, config, *, bubble_spacing=True, progress=None, diagnostics=None, thinking_enabled=False):
+def extract_page(data, name, config, *, bubble_spacing=True, progress=None, diagnostics=None, thinking_enabled=False, response_observer=None):
     crops = make_crops(data, name)
     if progress and len(crops) > 1:
         progress("split_batch", name, len(crops), len(crops), "")
     prompt = transcription_prompt(crops, config.ocr_scope)
     images = [(crop.data, crop.name) for crop in crops]
-    # No automatic audit/detail requests. Retry only a failed or malformed batch.
-    for attempt in range(2):
-        if diagnostics:
-            diagnostics({"event": "batch_request", "page": name, "attachments": len(crops),
-                         "source_height": crops[-1].core_bottom, "attempt": attempt + 1})
-        try:
-            raw = complete_external(config.provider, prompt, images, config=config, max_attempts=1,
-                                    thinking_enabled=thinking_enabled)
-            sections = parse_parts(raw, len(crops))
-            break
-        except Exception as exc:
-            if attempt:
-                raise RuntimeError("تعذر استخراج الصورة كاملة؛ لم يتم قبول رد ناقص.") from exc
-            prompt += "\nThe previous request failed or returned incomplete JSON. Return all manifest parts."
+    # Conversation resets and provider fallback belong to the chapter coordinator.
+    if diagnostics:
+        diagnostics({"event": "batch_request", "page": name, "attachments": len(crops),
+                     "source_height": crops[-1].core_bottom, "attempt": 1})
+    raw = complete_external(config.provider, prompt, images, config=config, max_attempts=1,
+                            thinking_enabled=thinking_enabled)
+    if response_observer:
+        response_observer(raw)
+    sections = parse_parts(raw, len(crops))
     records = []
     for crop, regions in zip(crops, sections):
         scale = (crop.bottom - crop.top) / 1000
         for item in regions:
             left, top, right, bottom = item["box"]
             absolute = [left, crop.top + top * scale, right, crop.top + bottom * scale]
-            if not crop.core_top <= (absolute[1] + absolute[3]) / 2 < crop.core_bottom:
+            if config.ocr_scope == "dialogue" and item["kind"].lower() in ("sfx", "sound", "sound_effect"):
+                continue
+            if not item["synthetic_box"] and not crop.core_top <= (absolute[1] + absolute[3]) / 2 < crop.core_bottom:
                 continue
             if any(_overlap(r["box"], absolute) > .35 and
                    SequenceMatcher(None, r["text"], item["text"]).ratio() > .85 for r in records):

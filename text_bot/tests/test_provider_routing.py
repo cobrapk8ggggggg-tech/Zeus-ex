@@ -145,3 +145,101 @@ class UIAndTranslationTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class RecoveryTests(unittest.TestCase):
+    def test_failed_batch_gets_new_gpt_thread_in_same_project_then_another_provider(self):
+        from utils import providers
+        from test_providers import account_token
+        import json
+        config = ProcessingConfig(provider="gpt", chatgpt_access_token=account_token(),
+            gemini_cookie_header="SID=test", deepseek_token="test")
+        state = {"gpt": {"conversation_id": "broken", "parent_message_id": "old-parent",
+                          "gizmo_id": "project-123", "project_name": "Chapter"}}
+        observed = []
+        def choose(provider, value):
+            state[provider] = value
+        def completion(provider, prompt, images, **kw):
+            observed.append((provider, dict(state.get(provider, {})), images, kw))
+            if provider == "gpt":
+                raise RuntimeError("service failed")
+            return json.dumps({"parts":[{"part": i, "regions":[{"text": text, "box":[10,400,900,450]}]}
+                for i,text in enumerate(("FIRST","SECOND","LAST"),1)]})
+        out = io.BytesIO(); Image.new("RGB",(24,18000),"white").save(out,format="PNG")
+        settings = {"_processing_config": config, "include_sfx": False}
+        with patch("utils.providers.load_provider_thread", side_effect=lambda p:{"state": state.get(p,{})}), \
+             patch("utils.providers.select_provider_thread", side_effect=choose), \
+             patch.object(bot,"load_accounts_data",return_value={"accounts":[]}), \
+             patch("utils.vision_ocr.complete_external",side_effect=completion), \
+             patch("utils.storage.save_processing_config") as save:
+            text = bot.extract_page_with_fallback(1,out.getvalue(),"page.png",False,settings)
+        self.assertEqual(text,"FIRST\n\nSECOND\n\nLAST")
+        self.assertEqual([o[0] for o in observed],["gpt","gpt","gemini"])
+        self.assertEqual(observed[0][1]["conversation_id"],"broken")
+        self.assertNotIn("conversation_id",observed[1][1])
+        self.assertEqual(observed[1][1]["gizmo_id"],"project-123")
+        self.assertEqual(observed[1][1]["project_name"],"Chapter")
+        self.assertTrue(all(len(o[2])==3 for o in observed))
+        self.assertEqual(observed[0][2],observed[1][2])
+        self.assertTrue(all(o[3]["config"].ocr_scope=="dialogue" for o in observed))
+        self.assertEqual(settings["_processing_config"].provider,"gpt")
+        save.assert_not_called()
+
+    def test_success_never_resets_a_conversation_or_calls_another_provider(self):
+        config=ProcessingConfig(provider="deepseek",deepseek_token="test")
+        with patch.object(bot,"load_accounts_data",return_value={"accounts":[]}), \
+             patch.object(bot,"extract_text_from_single_image",return_value="SOURCE") as extract, \
+             patch("utils.providers.new_thread") as new:
+            self.assertEqual(bot.extract_page_with_fallback(1,b"image","page.png",True,
+                {"_processing_config":config}),"SOURCE")
+        extract.assert_called_once()
+        self.assertEqual(extract.call_args.args[4]["_processing_config"].provider,"deepseek")
+        self.assertTrue(extract.call_args.args[3])
+        new.assert_not_called()
+
+    def test_all_providers_failing_is_bounded_and_explicit(self):
+        with patch.object(bot,"load_accounts_data",return_value={"accounts":[]}), \
+             patch.object(bot,"extract_text_from_single_image",side_effect=RuntimeError("offline")) as extract, \
+             patch("utils.providers.new_thread"):
+            with self.assertRaisesRegex(RuntimeError,"الاحتياطيين"):
+                bot.extract_page_with_fallback(1,b"image","page.png",False,
+                    {"_processing_config":ProcessingConfig(provider="dark")})
+        self.assertEqual(extract.call_count,2)
+
+
+class CapabilityAndSettingsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_protocols_with_a_real_thinking_switch_show_the_mode_step(self):
+        for provider in ("gpt","gemini","dark","deepseek","qwen"):
+            settings={"_processing_config":ProcessingConfig(provider=provider)}
+            fake=SimpleNamespace(confirmed=True,thinking_enabled=True,wait=AsyncMock())
+            with patch.object(bot,"ModeSelectView",return_value=fake) as view, \
+                 patch.object(bot,"send_mode_selection",new_callable=AsyncMock) as send:
+                result=await bot.select_processing_mode(SimpleNamespace(),1,settings)
+            self.assertEqual(result,provider in ("qwen","deepseek"))
+            self.assertEqual(view.call_count,int(provider in ("qwen","deepseek")))
+            self.assertEqual(send.await_count,view.call_count)
+
+    async def test_translation_toggle_and_target_reach_the_real_stage_for_every_provider(self):
+        for provider in ("qwen","gpt","gemini","dark","deepseek"):
+            for enabled in (False,True):
+                settings={"_processing_config":ProcessingConfig(provider=provider),
+                    "translate_enabled":enabled,"translate_target":"en","include_sfx":False}
+                with patch.object(bot,"vision_translate_chapter",return_value="Translated") as translate, \
+                     patch.object(bot,"edit_status",new_callable=AsyncMock):
+                    result,error=await bot.run_chapter_translation_stage(None,1,[(b"img","page.png")],
+                        {"page.png":"SOURCE"},"SOURCE",settings,False)
+                self.assertIsNone(error)
+                self.assertEqual(translate.call_count,int(enabled))
+                if enabled:
+                    self.assertEqual(result,"Translated")
+                    self.assertEqual(translate.call_args.args[2]["translate_target"],"en")
+                    self.assertFalse(translate.call_args.args[2]["include_sfx"])
+
+    async def test_user_sfx_overrides_console_trial_scope_for_every_external_provider(self):
+        for provider in ("gpt","gemini","dark","deepseek"):
+            for enabled in (False,True):
+                config=ProcessingConfig(provider=provider,ocr_scope="dialogue" if enabled else "all")
+                with patch("utils.vision_ocr.extract_page",return_value="SOURCE") as extract:
+                    bot.extract_text_from_single_image(1,b"img","page.png",False,
+                        {"_processing_config":config,"include_sfx":enabled,"bubble_spacing":False})
+                self.assertEqual(extract.call_args.args[2].ocr_scope,"all" if enabled else "dialogue")
+                self.assertFalse(extract.call_args.kwargs["bubble_spacing"])

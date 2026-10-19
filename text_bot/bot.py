@@ -35,7 +35,7 @@ BOT_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "656783724662226963"))
 TEMP_API_URL = os.getenv("TEMP_API_URL", "").rstrip("/")
 BASE_QWEN_URL = os.getenv("BASE_QWEN_URL", "https://chat.qwen.ai/api/v2").rstrip("/")
-BOT_VERSION = os.getenv("BOT_VERSION", "3.1.0")
+BOT_VERSION = os.getenv("BOT_VERSION", "3.2.0")
 GDRIVE_API_KEY = os.getenv("GDRIVE_API_KEY", "").strip()
 
 MAX_IMAGES_PER_REQUEST = int(os.getenv("MAX_IMAGES_PER_REQUEST", "10"))
@@ -89,7 +89,7 @@ from utils.emojis import THEMES, emoji_manager, emojize, themed_embed
 from utils.providers import (
     PROVIDER_LABELS, ProviderConfigurationError, complete_external,
     selected_provider, validate_provider,
-    get_processing_config, processing_config, snapshot_processing_settings,
+    get_processing_config, processing_config, snapshot_processing_settings, supports_thinking,
 )
 
 intents = discord.Intents.default()
@@ -2760,6 +2760,7 @@ def extract_text_from_single_image(user_id, image_bytes, image_name, thinking_en
     config = processing_config(settings)
     if config.provider != "qwen":
         from utils.vision_ocr import extract_page
+        config = replace(config, ocr_scope="all" if (settings or {}).get("include_sfx", False) else "dialogue")
         return extract_page(image_bytes, image_name, config,
                             bubble_spacing=(settings or {}).get("bubble_spacing", True), progress=progress_cb,
                             thinking_enabled=thinking_enabled)
@@ -3282,6 +3283,10 @@ async def _push_split_status(status_msg, stage, name, part, total_parts, label, 
                 f"الصفحة `{name}` — جاري استخراج كل الأجزاء (`{part}`) في طلب واحد مجمّع حسب ترتيبها.",
                 current=current, total=total,
             )
+        elif stage == "recovery":
+            await edit_status(status_msg, "جاري إنقاذ الصفحة",
+                f"الصفحة `{name}` — إعادة المحاولة بمحادثة جديدة، ثم مسار احتياطي عند الحاجة.",
+                current=current, total=total)
         elif stage == "split_fallback":
             await edit_status(
                 status_msg,
@@ -3317,15 +3322,56 @@ async def _push_split_status(status_msg, stage, name, part, total_parts, label, 
 # ============================================================
 # خط أنابيب استخراج الصفحات — نظام محاولات مزدوج للصفحات المتعثرة
 # ============================================================
+def extract_page_with_fallback(user_id, image_bytes, image_name, thinking_enabled, settings, progress_cb=None):
+    """Retry a failed page in a fresh thread, then other configured providers.
+
+    All attempts use the exact same whole image / ordered three-part batch.
+    Config is frozen per chapter; recovery never changes the owner's selection.
+    """
+    from utils.providers import PROVIDER_LOCKS, new_thread
+    config = processing_config(settings)
+    available = [(config.provider, config)]
+    for provider in ("gpt", "gemini", "deepseek", "dark", "qwen"):
+        if provider == config.provider:
+            continue
+        candidate = replace(config, provider=provider)
+        # Qwen needs an existing account before being used as an automatic backup.
+        if provider == "qwen" and not load_accounts_data(user_id).get("accounts"):
+            continue
+        try:
+            validate_provider({"_processing_config": candidate})
+        except ProviderConfigurationError:
+            continue
+        available.append((provider, candidate))
+    last_error = None
+    for provider, candidate in available:
+        attempt_settings = {**(settings or {}), "_processing_config": candidate}
+        for fresh in (False, True):
+            try:
+                if provider in PROVIDER_LOCKS:
+                    # Reset + retry must be atomic with respect to other jobs and /zx.
+                    with PROVIDER_LOCKS[provider]:
+                        if fresh:
+                            if provider == "dark":
+                                # Stateless service: a second HTTP request is already independent.
+                                pass
+                            else:
+                                new_thread(provider, config=candidate)
+                        return extract_text_from_single_image(user_id, image_bytes, image_name,
+                            thinking_enabled if supports_thinking(provider) else False,
+                            attempt_settings, progress_cb=progress_cb)
+                else:
+                    return extract_text_from_single_image(user_id, image_bytes, image_name,
+                        thinking_enabled, attempt_settings, progress_cb=progress_cb)
+            except Exception as exc:
+                last_error = exc
+                if progress_cb:
+                    progress_cb("recovery", image_name, 0, 0, "")
+    raise RuntimeError("تعذر استخراج الصفحة بعد المحادثة الجديدة والمزودين الاحتياطيين؛ لم تُقبل نتيجة ناقصة.") from last_error
+
+
 async def run_extraction_pipeline(status_msg, user_id, images, thinking_enabled, settings):
-    """
-    يستخرج نص كل صفحة مع نظام محاولات قوي ومعالجة متوازية:
-    - كل صفحة تحصل على محاولات داخلية كاملة + تقسيم ذكي للشرائط الطويلة.
-    - عدة صفحات تُعالج في نفس اللحظة (EXTRACTION_CONCURRENCY) لتقصير المدة الكلية.
-    - الصفحات التي تفشل فعلياً تُعاد مرة أخيرة بوضع الدقة الكاملة قبل الاستسلام.
-    - لا يتوقف الفصل كله بسبب صفحة واحدة فاشلة.
-    يعيد: (combined_text, empty_images, failed_page_names)
-    """
+    """Process every page with bounded fresh-thread recovery and provider fallback."""
     total_images = len(images)
     page_texts = {}
     failed_notices = {}
@@ -3346,7 +3392,7 @@ async def run_extraction_pipeline(status_msg, user_id, images, thinking_enabled,
         async with semaphore:
             try:
                 page_texts[idx] = await asyncio.to_thread(
-                    extract_text_from_single_image,
+                    extract_page_with_fallback,
                     user_id,
                     img_bytes,
                     img_name,
@@ -3361,7 +3407,7 @@ async def run_extraction_pipeline(status_msg, user_id, images, thinking_enabled,
             detail = f"اكتملت معالجة `{completed}` من `{total_images}` صفحة."
             if failed_notices:
                 names = "، ".join(f"`{name}`" for name in list(failed_notices.keys())[:4])
-                detail += f"\nصفحات ستحصل على محاولة إنقاذ بعد اكتمال البقية: {names}"
+                detail += f"\nصفحات لم تكتمل بعد محاولات الإنقاذ: {names}"
             async with progress_lock:
                 await edit_status(
                     status_msg,
@@ -3376,28 +3422,6 @@ async def run_extraction_pipeline(status_msg, user_id, images, thinking_enabled,
         for idx, (img_bytes, img_name) in enumerate(images, start=1)
     ]
     await asyncio.gather(*tasks)
-
-    retry_pages = [idx for idx, text in page_texts.items() if text is None]
-    if retry_pages:
-        await edit_status(
-            status_msg,
-            "محاولة إنقاذ أخيرة للصفحات المتعثرة",
-            f"عدد الصفحات: `{len(retry_pages)}` — جاري إعادة المحاولة بوضع دقة كاملة وتقسيم ذكي.",
-        )
-        for idx in retry_pages:
-            img_bytes, img_name = images[idx - 1]
-            try:
-                page_texts[idx] = await asyncio.to_thread(
-                    extract_text_from_single_image,
-                    user_id,
-                    img_bytes,
-                    img_name,
-                    True,  # وضع الدقة الكاملة في المحاولة الأخيرة
-                    settings,
-                    progress_cb=thread_progress,
-                )
-            except Exception:
-                page_texts[idx] = None
 
     combined_text = ""
     empty_images = 0
@@ -3428,7 +3452,7 @@ class ModeSelectView(discord.ui.View):
             self.children[0].emoji = emoji_manager.partial("bolt")
             self.children[1].emoji = emoji_manager.partial("circlecheck")
 
-    @discord.ui.button(label="سرعة عالية", emoji=emoji_manager.partial("bolt"), style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="سريع — بدون تفكير", emoji=emoji_manager.partial("bolt"), style=discord.ButtonStyle.secondary)
     async def high_speed(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("هذا الزر ليس لك.", ephemeral=True)
@@ -3438,7 +3462,7 @@ class ModeSelectView(discord.ui.View):
         await interaction.response.defer()
         self.stop()
 
-    @discord.ui.button(label="دقة كاملة", emoji=emoji_manager.partial("circlecheck"), style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="قوي — مع التفكير", emoji=emoji_manager.partial("circlecheck"), style=discord.ButtonStyle.secondary)
     async def high_accuracy(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("هذا الزر ليس لك.", ephemeral=True)
@@ -3451,17 +3475,22 @@ class ModeSelectView(discord.ui.View):
 def mode_selection_sections():
     return [
         f"## {emoji_manager.placeholder('settings')} اختر وضع المعالجة",
-        (
-            f"### {emoji_manager.placeholder('bolt')} سرعة عالية — موصى به\n"
-            "يحافظ على الدقة بشكل ممتاز ويعطي نتيجة أسرع لمعظم الفصول.\n"
-            "**استخدمه افتراضيًا** إلا إذا كان الفصل صعبًا جدًا أو النص غير واضح."
-        ),
-        (
-            f"### {emoji_manager.placeholder('circlecheck')} دقة كاملة\n"
-            "يطلب تدقيقًا إضافيًا للحالات الصعبة جدًا.\n"
-            f"{emoji_manager.placeholder('alerttriangle')} **تنبيه:** قد يطول كثيرًا مع الفصول الطويلة أو الشريطية (معالجة متوازية دقيقة الجزء بالجزء)."
-        ),
+        f"### {emoji_manager.placeholder('bolt')} سريع\nالتفكير معطّل. مناسب للاستخراج اليومي.",
+        f"### {emoji_manager.placeholder('circlecheck')} قوي\nالتفكير مفعّل. قد يستغرق وقتًا أطول للنصوص المعقدة.",
     ]
+
+
+async def select_processing_mode(destination, user_id, settings):
+    if not supports_thinking(selected_provider(settings)):
+        return False
+    view = ModeSelectView(user_id)
+    await send_mode_selection(destination, view)
+    await view.wait()
+    if not view.confirmed:
+        await destination.send(emojize("{emoji:clock} انتهى وقت اختيار الوضع. أعد تشغيل الأمر."))
+        return None
+    return view.thinking_enabled
+
 
 async def send_mode_selection(destination, view):
     if V2_SEPARATOR_SUPPORTED:
@@ -4062,6 +4091,11 @@ def profile_embed(user, profile):
 @bot.event
 async def on_ready():
     print(emojize(f"{emoji_manager.placeholder('circlecheck')} ZEUS text bot جاهز (v{BOT_VERSION})"))
+    try:
+        from utils.providers import import_owner_cookie_file
+        await asyncio.to_thread(import_owner_cookie_file)
+    except Exception:
+        print("[Gemini] تعذر استيراد ملف الكوكيز؛ لم تُعرض قيم الجلسة.")
     if os.getenv("PUBLIC_FILE_BASE_URL") or os.getenv("RAILWAY_PUBLIC_DOMAIN"):
         try:
             from utils.file_links import start_file_server
@@ -4135,13 +4169,9 @@ async def extract(interaction: discord.Interaction):
 
     if not await ensure_provider_available(interaction.followup, settings):
         return
-    view = ModeSelectView(user_id)
-    await send_mode_selection(interaction.followup, view)
-    await view.wait()
-    if not view.confirmed:
-        await interaction.followup.send("{emoji:clock} **انتهى وقت اختيار وضع المعالجة. أعد تشغيل الأمر عندما تكون جاهزًا.**", ephemeral=True)
+    thinking_enabled = await select_processing_mode(interaction.followup, user_id, settings)
+    if thinking_enabled is None:
         return
-    thinking_enabled = view.thinking_enabled
 
     await send_upload_prompt(interaction.followup)
 
@@ -4424,13 +4454,9 @@ async def translate(interaction: discord.Interaction,
     if not await ensure_provider_available(interaction.followup, settings):
         return
     # الخطوة الأولى — اختيار وضع المعالجة (نفس تفاعل /extract تمامًا)
-    view = ModeSelectView(user_id)
-    await send_mode_selection(interaction.followup, view)
-    await view.wait()
-    if not view.confirmed:
-        await interaction.followup.send("{emoji:clock} **انتهى وقت اختيار وضع المعالجة. أعد تشغيل الأمر عندما تكون جاهزًا.**", ephemeral=True)
+    thinking_enabled = await select_processing_mode(interaction.followup, user_id, settings)
+    if thinking_enabled is None:
         return
-    thinking_enabled = view.thinking_enabled
 
     chapter_text = ""
     images = None
@@ -4668,7 +4694,8 @@ async def open_provider_console(interaction):
     try:
         config = await asyncio.to_thread(get_processing_config)
         state = await asyncio.to_thread(provider_thread, config.provider) if config.provider != "qwen" else {}
-        await interaction.followup.send(view=ProviderConsole(sys.modules[__name__], config, state), ephemeral=True)
+        view = ProviderConsole(sys.modules[__name__], config, state)
+        view.message = await interaction.followup.send(view=view, ephemeral=True, wait=True)
     except Exception:
         await interaction.followup.send("تعذر فتح لوحة المعالجة. تحقق من الاتصال بقاعدة البيانات.", ephemeral=True)
 
@@ -4730,13 +4757,9 @@ async def prefix_translate(ctx):
     if not await ensure_provider_available(ctx, settings):
         return
     # الخطوة الأولى — اختيار وضع المعالجة (نفس تفاعل !استخراج تمامًا)
-    view = ModeSelectView(user_id)
-    await send_mode_selection(ctx, view)
-    await view.wait()
-    if not view.confirmed:
-        await ctx.send("{emoji:clock} **انتهى وقت اختيار وضع المعالجة. أعد تشغيل الأمر عندما تكون جاهزًا.**")
+    thinking_enabled = await select_processing_mode(ctx, user_id, settings)
+    if thinking_enabled is None:
         return
-    thinking_enabled = view.thinking_enabled
 
     chapter_text = ""
     images = None
@@ -4810,11 +4833,8 @@ async def prefix_extract(ctx):
     settings = snapshot_processing_settings(profile["settings"])
     if not await ensure_provider_available(ctx, settings):
         return
-    view = ModeSelectView(user_id)
-    await send_mode_selection(ctx, view)
-    await view.wait()
-    if not view.confirmed:
-        await ctx.send("{emoji:clock} **انتهى وقت اختيار وضع المعالجة. أعد تشغيل الأمر عندما تكون جاهزًا.**")
+    thinking_enabled = await select_processing_mode(ctx, user_id, settings)
+    if thinking_enabled is None:
         return
 
     await send_upload_prompt(ctx)
@@ -4871,11 +4891,11 @@ async def prefix_extract(ctx):
     total_images = len(images)
     await edit_status(status_msg, "بدأ الاستخراج", f"تم العثور على `{total_images}` صورة.", current=0, total=total_images)
 
-    combined_text, empty_images, failed_pages, page_texts = await run_extraction_pipeline(status_msg, user_id, images, view.thinking_enabled, settings)
+    combined_text, empty_images, failed_pages, page_texts = await run_extraction_pipeline(status_msg, user_id, images, thinking_enabled, settings)
 
     # مرحلة الترجمة الأدبية (اختيارية — معطلة افتراضيًا) — تتم من الصور نفسها بسياقها البصري
     translated_text, translated_error = await run_chapter_translation_stage(
-        status_msg, user_id, images, page_texts, combined_text, settings, view.thinking_enabled,
+        status_msg, user_id, images, page_texts, combined_text, settings, thinking_enabled,
     )
 
     ok, profile_after, point_source = await resolve_and_consume_point(user_id, guild_id)
