@@ -1,9 +1,10 @@
-"""Account clients adapted only from the two user-supplied Python files.
+"""Account clients plus the two additional HTTP services supplied by the owner.
 
 Gemini: gemini_complete.py (StreamGenerate + bard-storage).
 GPT: chatgpt_android_interactive.py (Android backend + file upload).
 HTTP sessions are request-local; the owner-selected server conversations are
 durable in MongoDB. Requests to each conversation are serialized.
+Dark GPT-OCR is stateless; DeepSeek uses the supplied worker's session API.
 """
 
 import base64
@@ -26,8 +27,8 @@ from utils.storage import (load_processing_config, load_provider_thread, save_pr
                            select_provider_thread, list_provider_threads)
 
 
-PROVIDER_LABELS = {"qwen": "Qwen", "gemini": "Gemini", "gpt": "GPT"}
-PROVIDER_LOCKS = {name: threading.RLock() for name in ("gemini", "gpt")}
+PROVIDER_LABELS = {"qwen": "Qwen", "gemini": "Gemini", "gpt": "GPT", "dark": "GPT-OCR", "deepseek": "DeepSeek"}
+PROVIDER_LOCKS = {name: threading.RLock() for name in ("gemini", "gpt", "dark", "deepseek")}
 
 
 class ProviderConfigurationError(RuntimeError):
@@ -40,10 +41,11 @@ class ProcessingConfig:
     chatgpt_model: str = "auto"
     gemini_cookie_header: str = field(default="", repr=False)
     chatgpt_access_token: str = field(default="", repr=False)
-    ocr_crop_height: int = 1700
-    ocr_double_check: bool = True
     ocr_scope: str = "all"
-    ocr_rescue_limit: int = 4
+    dark_system_prompt: str = "Follow the current task precisely. Preserve original text when performing OCR."
+    deepseek_token: str = field(default="", repr=False)
+    deepseek_model: str = ""
+    deepseek_thinking: bool = False
 
 
 def get_processing_config():
@@ -53,10 +55,11 @@ def get_processing_config():
         chatgpt_model=saved.get("chatgpt_model") or os.getenv("CHATGPT_MODEL", "auto"),
         gemini_cookie_header=saved.get("gemini_cookie_header") or os.getenv("GEMINI_COOKIE_HEADER", ""),
         chatgpt_access_token=saved.get("chatgpt_access_token") or os.getenv("CHATGPT_ACCESS_TOKEN", ""),
-        ocr_crop_height=max(900, min(2400, int(saved.get("ocr_crop_height", 1700)))),
-        ocr_double_check=bool(saved.get("ocr_double_check", True)),
         ocr_scope=saved.get("ocr_scope", "all"),
-        ocr_rescue_limit=max(0, min(12, int(saved.get("ocr_rescue_limit", 4)))),
+        dark_system_prompt=saved.get("dark_system_prompt", ProcessingConfig.dark_system_prompt),
+        deepseek_token=saved.get("deepseek_token") or os.getenv("DEEPSEEK_TOKEN", ""),
+        deepseek_model=saved.get("deepseek_model", os.getenv("DEEPSEEK_MODEL", "")),
+        deepseek_thinking=bool(saved.get("deepseek_thinking", False)),
     )
 
 
@@ -178,6 +181,8 @@ def validate_provider(settings=None):
         _gemini_cookies(config)
     elif provider == "gpt":
         _chatgpt_credentials(config)
+    elif provider == "deepseek" and not config.deepseek_token.strip():
+        raise ProviderConfigurationError("جلسة المعالجة غير معدة. يرجى التواصل مع إدارة البوت.")
     return provider
 
 
@@ -201,7 +206,15 @@ def new_thread(provider, *, ordinary=False):
 
 
 def inspect_account(provider, action, config):
-    client = ChatGPTClient(config) if provider == "gpt" else GeminiClient(config)
+    if provider == "dark":
+        if action != "account":
+            raise ProviderConfigurationError("الخدمة لا توفر قوائم حساب أو محادثات.")
+        client = DarkOCRClient(config)
+        try:
+            return {"connected": client.complete("Reply with ZEUS_OK only.", (), ()) == "ZEUS_OK"}
+        finally:
+            client.session.close()
+    client = ChatGPTClient(config) if provider == "gpt" else DeepSeekClient(config) if provider == "deepseek" else GeminiClient(config)
     try:
         if provider == "gpt":
             if action == "account":
@@ -214,6 +227,12 @@ def inspect_account(provider, action, config):
                     info["model_list_available"] = False
                     info["model_list_error"] = str(exc)
                 return info
+            return getattr(client, action)()
+        if provider == "deepseek":
+            if action == "account":
+                return {"connected": True, "conversations": len(client.chats())}
+            if action == "chats":
+                return list_provider_threads("deepseek")
             return getattr(client, action)()
         if action == "account":
             return client.connection_status()
@@ -514,13 +533,142 @@ class ChatGPTClient:
         return answer
 
 
-def complete_external(provider, prompt, images=(), *, max_attempts=2, thinking_enabled=False, config=None, files=()):
-    if provider not in ("gemini", "gpt"):
+class DarkOCRClient:
+    BASE = "https://dark.ps/v2/gpt-ocr/completions"
+
+    def __init__(self, config):
+        self.config = config
+        self.session = requests.Session()
+
+    def _request(self, prompt, urls):
+        with self.session.post(self.BASE, json={"prompt": prompt,
+                "system_prompt": self.config.dark_system_prompt, "file_urls": urls},
+                stream=True, timeout=(15, 300), allow_redirects=False) as response:
+            _check_response(response)
+            if 300 <= response.status_code < 400:
+                raise RuntimeError("وجهة المعالجة أعادت توجيهًا غير متوقع.")
+            pieces, pending, done = [], [], False
+            started = time.monotonic()
+            def consume(raw):
+                nonlocal done
+                if raw == b"[DONE]":
+                    done = True
+                    return
+                try:
+                    event = json.loads(raw)
+                except (ValueError, TypeError):
+                    raise RuntimeError("بث المعالجة غير صالح.") from None
+                if not isinstance(event, dict) or event.get("error"):
+                    raise RuntimeError("تعذر إكمال طلب المعالجة.")
+                if isinstance(event.get("text"), str):
+                    pieces.append(event["text"])
+                done = event.get("done") is True
+            for line in response.iter_lines():
+                if time.monotonic() - started > 300:
+                    raise RuntimeError("انتهت مهلة المعالجة.")
+                if line.startswith(b"data:"):
+                    pending.append(line[5:].lstrip())
+                elif not line and pending:
+                    consume(b"\n".join(pending))
+                    pending = []
+                    if done:
+                        break
+            if pending and not done:
+                consume(b"\n".join(pending))
+            if not done:
+                raise RuntimeError("انقطع بث المعالجة قبل اكتماله.")
+            answer = "".join(pieces).strip()
+            if not answer:
+                raise RuntimeError("استجابة فارغة من محرك المعالجة.")
+            return answer
+
+    def complete(self, prompt, images, files=(), file_urls=()):
+        from urllib.parse import urlsplit
+        urls = list(file_urls)
+        if len(images) + len(files) + len(urls) > 10:
+            raise ProviderConfigurationError("الخدمة تقبل عشرة مرفقات كحد أقصى في الطلب.")
+        for url in urls:
+            parsed = urlsplit(url)
+            if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.username or parsed.password:
+                raise ProviderConfigurationError("رابط المرفق غير صالح.")
+        attachments = []
+        for data, name in images:
+            data, name, _, _, _ = _image_info(data, name)
+            attachments.append((data, name))
+        attachments.extend(files)
+        if not attachments:
+            return self._request(prompt, urls)
+        from utils.file_links import temporary_links
+        with temporary_links(attachments) as generated:
+            return self._request(prompt, generated + urls)
+
+
+class DeepSeekClient:
+    BASE = "https://deepseek-pow.contact-3mh.workers.dev"
+
+    def __init__(self, config):
+        self.config, self.state = config, {}
+        self.thinking_enabled = config.deepseek_thinking
+        self.session = requests.Session()
+
+    def post(self, path, body):
+        with self.session.post(self.BASE + path, json={"token": self.config.deepseek_token, **body},
+                timeout=(15, 300), allow_redirects=False) as response:
+            _check_response(response)
+            if 300 <= response.status_code < 400:
+                raise RuntimeError("وجهة المعالجة أعادت توجيهًا غير متوقع.")
+            payload = response.json()
+        if not isinstance(payload, dict) or payload.get("error") or payload.get("success") is False:
+            raise RuntimeError("تعذر تنفيذ الطلب لدى خدمة المعالجة.")
+        return payload
+
+    def chats(self):
+        return self.post("/api/chat/sessions/list", {}).get("sessions", [])
+
+    def models(self):
+        with self.session.get(self.BASE + "/v1/models",
+                headers={"x-deepseek-token": self.config.deepseek_token},
+                timeout=(15, 60), allow_redirects=False) as response:
+            _check_response(response)
+            payload = response.json()
+        return [{"slug": item["id"], "title": item["id"]} for item in payload.get("data", []) if isinstance(item.get("id"), str)]
+
+    def complete(self, prompt, images, files=()):
+        uploads = []
+        for data, name in images:
+            data, name, mime, _, _ = _image_info(data, name)
+            uploads.append({"filename": name, "file_data": "data:" + mime + ";base64," + base64.b64encode(data).decode()})
+        for data, name in files:
+            mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+            uploads.append({"filename": name, "file_data": "data:" + mime + ";base64," + base64.b64encode(data).decode()})
+        body = {"prompt": prompt, "thinking_enabled": bool(self.thinking_enabled), "search_enabled": False}
+        if uploads:
+            body["files"] = uploads
+        if self.config.deepseek_model:
+            body["model"] = self.config.deepseek_model
+        cid = self.state.get("conversation_id")
+        if cid:
+            body["session_id"] = cid
+        if self.state.get("parent_message_id") is not None:
+            body["parent_message_id"] = self.state["parent_message_id"]
+        result = self.post("/api/chat", body)
+        if cid and result.get("session_id") != cid:
+            raise ProviderConfigurationError("الخادم لم يتابع المحادثة المختارة؛ اختر محادثة صالحة من الإدارة.")
+        if result.get("session_id"):
+            self.state["conversation_id"] = result["session_id"]
+        if result.get("parent_message_id") is not None:
+            self.state["parent_message_id"] = result["parent_message_id"]
+        return result.get("response") or ""
+
+def complete_external(provider, prompt, images=(), *, max_attempts=2, thinking_enabled=False, config=None, files=(), file_urls=()):
+    if provider not in PROVIDER_LOCKS:
         raise ProviderConfigurationError("إعداد المعالجة غير صالح. يرجى التواصل مع إدارة البوت.")
     config = config or ProcessingConfig(
         provider=provider, chatgpt_model=os.getenv("CHATGPT_MODEL", "auto"),
         gemini_cookie_header=os.getenv("GEMINI_COOKIE_HEADER", ""),
         chatgpt_access_token=os.getenv("CHATGPT_ACCESS_TOKEN", ""),
+        deepseek_token=os.getenv("DEEPSEEK_TOKEN", ""),
+        deepseek_model=os.getenv("DEEPSEEK_MODEL", ""),
     )
     if validate_provider({"_processing_config": config}) != provider:
         raise ProviderConfigurationError("إعداد المعالجة غير متطابق.")
@@ -529,10 +677,18 @@ def complete_external(provider, prompt, images=(), *, max_attempts=2, thinking_e
     if thinking_enabled:
         prompt += "\n\nCheck every line carefully against the source before returning the final answer only."
     with PROVIDER_LOCKS[provider]:
-        return _complete_persistent(provider, prompt, images, files, config, max_attempts)
+        if provider == "dark":
+            client = DarkOCRClient(config)
+            try:
+                return client.complete(prompt, images, files, file_urls)
+            finally:
+                client.session.close()
+        if file_urls:
+            raise ProviderConfigurationError("الروابط المباشرة متاحة لخدمة GPT-OCR فقط.")
+        return _complete_persistent(provider, prompt, images, files, config, max_attempts, thinking_enabled)
 
 
-def _complete_persistent(provider, prompt, images, files, config, max_attempts):
+def _complete_persistent(provider, prompt, images, files, config, max_attempts, thinking_enabled=False):
     document = load_provider_thread(provider)
     state, revision = document.get("state") or {}, document.get("revision", 0)
     if provider == "gpt":
@@ -540,8 +696,16 @@ def _complete_persistent(provider, prompt, images, files, config, max_attempts):
         if state.get("account_id") and state["account_id"] != account:
             raise ProviderConfigurationError("المحادثة محفوظة لحساب مختلف. اختر محادثة لهذا الحساب من الإدارة.")
         state["account_id"] = account
+    if provider == "deepseek":
+        import hashlib
+        fingerprint = hashlib.sha256(config.deepseek_token.encode()).hexdigest()
+        if state.get("credential_fingerprint") and state["credential_fingerprint"] != fingerprint:
+            raise ProviderConfigurationError("المحادثة محفوظة لجلسة مختلفة؛ اختر محادثة جديدة من الإدارة.")
+        state["credential_fingerprint"] = fingerprint
     for attempt in range(max(1, max_attempts)):
-        client = GeminiClient(config) if provider == "gemini" else ChatGPTClient(config)
+        client = GeminiClient(config) if provider == "gemini" else DeepSeekClient(config) if provider == "deepseek" else ChatGPTClient(config)
+        if provider == "deepseek":
+            client.thinking_enabled = thinking_enabled or config.deepseek_thinking
         client.state = dict(state)
         try:
             answer = client.complete(prompt, images, files).strip()

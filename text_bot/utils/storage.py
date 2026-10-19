@@ -109,7 +109,8 @@ def load_processing_config():
 
 
 def save_processing_config(**changes):
-    allowed = {"provider", "chatgpt_model", "gemini_cookie_header", "chatgpt_access_token", "ocr_crop_height", "ocr_double_check", "ocr_scope", "ocr_rescue_limit"}
+    allowed = {"provider", "chatgpt_model", "gemini_cookie_header", "chatgpt_access_token", "ocr_scope",
+               "dark_system_prompt", "deepseek_token", "deepseek_model", "deepseek_thinking"}
     if not changes or set(changes) - allowed:
         raise ValueError("إعداد معالجة غير صالح.")
     _get_db().bot_settings.update_one(

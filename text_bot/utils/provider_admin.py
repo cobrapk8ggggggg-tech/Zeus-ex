@@ -16,7 +16,7 @@ from utils.storage import save_processing_config
 
 
 _UPLOADS = set()
-_PENDING = {"gpt": [], "gemini": []}
+_PENDING = {"gpt": [], "gemini": [], "dark": [], "deepseek": []}
 
 
 def safe(value, limit=500):
@@ -85,7 +85,8 @@ class RecordPicker(discord.ui.LayoutView):
         try:
             record = self.records[int(interaction.data["values"][0])]
             if self.action == "models":
-                await asyncio.to_thread(save_processing_config, chatgpt_model=record["slug"])
+                key = "deepseek_model" if self.console.provider == "deepseek" else "chatgpt_model"
+                await asyncio.to_thread(save_processing_config, **{key: record["slug"]})
             elif self.action == "projects":
                 await asyncio.to_thread(choose_thread, "gpt", {"gizmo_id": record["id"], "project_name": record["name"], "title": "محادثة جديدة"})
             elif self.action == "chats":
@@ -102,6 +103,8 @@ class RecordPicker(discord.ui.LayoutView):
                 })
             elif self.action == "gemini_chats":
                 await asyncio.to_thread(choose_thread, "gemini", record)
+            elif self.action == "deepseek_chats":
+                await asyncio.to_thread(choose_thread, "deepseek", record)
             await self.console.refresh(interaction)
         except Exception:
             await interaction.followup.send("تعذر تطبيق الاختيار. تحقق من الجلسة ثم حاول مجددًا.", ephemeral=True)
@@ -109,19 +112,21 @@ class RecordPicker(discord.ui.LayoutView):
 
 class TextModal(discord.ui.Modal):
     def __init__(self, console, action):
-        titles = {"token": "تحديث جلسة GPT", "message": "رسالة في المحادثة المختارة", "open_chat": "اختيار محادثة GPT برابط", "quality": "جودة استخراج الصور", "model": "تحديد نموذج GPT"}
+        titles = {"token": "تحديث جلسة GPT", "deepseek_token": "تحديث جلسة DeepSeek",
+                  "system_prompt": "تعليمات GPT-OCR", "urls": "صور أو PDF عبر روابط",
+                  "message": "إرسال طلب", "open_chat": "اختيار محادثة GPT برابط", "model": "تحديد النموذج"}
         super().__init__(title=titles[action])
         self.console, self.action = console, action
-        if action == "quality":
-            self.value = discord.ui.TextInput(label="ارتفاع المقطع بالبكسل (900–2400)", default=str(console.config.ocr_crop_height))
-        else:
-            self.value = discord.ui.TextInput(label={"token": "Access token لحساب ChatGPT", "message": "نص الرسالة", "open_chat": "رابط المحادثة أو المعرّف", "model": "معرّف النموذج أو auto"}[action],
-                                             style=discord.TextStyle.paragraph, max_length=4000)
+        self.value = discord.ui.TextInput(label={"token": "Access token لحساب ChatGPT", "deepseek_token": "توكن DeepSeek",
+            "system_prompt": "تعليمات النظام", "urls": "طلب الاستخراج أو السؤال", "message": "نص الرسالة",
+            "open_chat": "رابط المحادثة أو المعرّف", "model": "معرّف النموذج (default لافتراضي DeepSeek)"}[action],
+            default=console.config.dark_system_prompt if action == "system_prompt" else None,
+            style=discord.TextStyle.paragraph, max_length=4000)
         self.add_item(self.value)
-        self.rescue_limit = None
-        if action == "quality":
-            self.rescue_limit = discord.ui.TextInput(label="حد التكبير لكل صفحة (0–12)", default=str(console.config.ocr_rescue_limit))
-            self.add_item(self.rescue_limit)
+        if action == "urls":
+            self.urls = discord.ui.TextInput(label="رابط HTTP/HTTPS في كل سطر — عشرة كحد أقصى",
+                                            style=discord.TextStyle.paragraph, max_length=4000)
+            self.add_item(self.urls)
 
     async def interaction_check(self, interaction):
         return await guard(self.console.api, interaction)
@@ -144,18 +149,27 @@ class TextModal(discord.ui.Modal):
                 if old and old["account_id"] != details["account_id"]:
                     await asyncio.to_thread(choose_thread, "gpt", {"title": "محادثة جديدة", "account_id": details["account_id"]})
                     _PENDING["gpt"].clear()
+            elif self.action == "deepseek_token":
+                candidate = replace(config, provider="deepseek", deepseek_token=value)
+                await asyncio.to_thread(inspect_account, "deepseek", "account", candidate)
+                await asyncio.to_thread(save_processing_config, deepseek_token=value)
+                if value != config.deepseek_token:
+                    await asyncio.to_thread(choose_thread, "deepseek", {"title": "محادثة جديدة"})
+                    _PENDING["deepseek"].clear()
+            elif self.action == "system_prompt":
+                await asyncio.to_thread(save_processing_config, dark_system_prompt=value)
+            elif self.action == "urls":
+                urls = [line.strip() for line in self.urls.value.splitlines() if line.strip()]
+                if not 1 <= len(urls) <= 10:
+                    raise ValueError()
+                answer = await asyncio.to_thread(complete_external, "dark", value, file_urls=urls,
+                                                config=replace(config, provider="dark"), max_attempts=1)
+                await interaction.followup.send(file=discord.File(io.BytesIO(answer.encode()), filename="url-response.txt"), ephemeral=True)
             elif self.action == "model":
                 if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value):
                     raise ValueError()
-                await asyncio.to_thread(save_processing_config, chatgpt_model=value)
-            elif self.action == "quality":
-                height = int(value)
-                if not 900 <= height <= 2400:
-                    raise ValueError()
-                rescue_limit = int(self.rescue_limit.value)
-                if not 0 <= rescue_limit <= 12:
-                    raise ValueError()
-                await asyncio.to_thread(save_processing_config, ocr_crop_height=height, ocr_rescue_limit=rescue_limit)
+                key = "deepseek_model" if self.console.provider == "deepseek" else "chatgpt_model"
+                await asyncio.to_thread(save_processing_config, **{key: "" if key == "deepseek_model" and value == "default" else value})
             elif self.action == "open_chat":
                 match = re.search(r"(?:/c/)?([a-zA-Z0-9-]{16,})/?(?:\?.*)?$", value)
                 if not match:
@@ -175,7 +189,7 @@ class TextModal(discord.ui.Modal):
                 answer = await asyncio.to_thread(complete_external, self.console.provider, value,
                     [(p[0], p[1]) for p in pending if p[2]], files=[(p[0], p[1]) for p in pending if not p[2]], config=candidate)
                 _PENDING[self.console.provider].clear()
-                await interaction.followup.send("رد المحادثة المختارة:", file=discord.File(io.BytesIO(answer.encode()), filename="response.txt"), ephemeral=True)
+                await interaction.followup.send("نتيجة الطلب:", file=discord.File(io.BytesIO(answer.encode()), filename="response.txt"), ephemeral=True)
             await self.console.refresh(interaction)
         except Exception:
             await interaction.followup.send("تعذر تنفيذ الطلب. تحقق من البيانات والجلسة. لم يتم عرض بيانات الاتصال.", ephemeral=True)
@@ -224,10 +238,18 @@ class ProviderConsole(discord.ui.LayoutView):
         if self.provider == "qwen":
             self.text(box, "## {emoji:user} حسابات Qwen\nالنموذج: `qwen3.8-max`\nحسابات المعالجة والتبديل والحدود تبقى وفق المسار الأصلي.")
             actions = [("إدارة الحسابات", "qwen_accounts", "user"), ("الحالة والاستخدام", "qwen_status", "chartpie")]
+        elif self.provider == "dark":
+            self.text(box, "## {emoji:photo} GPT-OCR\nصور وPDF بروابط، حتى 10 مرفقات في الطلب.\n"
+                          f"المرفقات الجاهزة: `{len(_PENDING['dark'])}`\n"
+                          "القطع الثلاث تُرسل معًا بالترتيب. الخدمة تعمل بطلبات مستقلة ولا تعيد معرّف محادثة.\n"
+                          "روابط المرفقات التي ينشئها البوت مؤقتة وتُحذف عند انتهاء الطلب.")
+            actions = [("فحص الاتصال", "account", "shieldcheck"), ("تعليمات النظام", "system_prompt", "adjustments"),
+                       ("روابط صور أو PDF", "urls", "folderopen"), ("طلب نصي", "message", "message"),
+                       ("إرفاق صورة أو ملف", "attachment", "photo"), ("مسح المرفقات", "clear", "trash")]
         else:
-            has_session = bool(self.config.chatgpt_access_token) if self.provider == "gpt" else bool(self.config.gemini_cookie_header)
+            has_session = bool(self.config.chatgpt_access_token) if self.provider == "gpt" else bool(self.config.deepseek_token) if self.provider == "deepseek" else bool(self.config.gemini_cookie_header)
             cid = self.state.get("conversation_id")
-            model = self.config.chatgpt_model if self.provider == "gpt" else "adaptive"
+            model = self.config.chatgpt_model if self.provider == "gpt" else (self.config.deepseek_model or "افتراضي الخدمة") if self.provider == "deepseek" else "adaptive"
             title = self.state.get('title')
             if cid and title == "محادثة جديدة":
                 title = "المحادثة الحالية"
@@ -240,6 +262,12 @@ class ProviderConsole(discord.ui.LayoutView):
                 actions = [("معلومات الحساب والتوكن", "account", "infocircle"), ("تحديث التوكن", "token", "lock"),
                            ("نماذج الحساب", "models", "adjustments"), ("تحديد نموذج يدويًا", "model", "adjustments"), ("مشاريع الحساب", "projects", "folderopen"),
                            ("اختيار محادثة", "chats", "message"), ("فتح برابط", "open_chat", "bookmark")]
+            elif self.provider == "deepseek":
+                self.text(box, "-# يستمر session_id وparent_message_id بين الطلبات. قائمة المحادثات تعرض ما حفظه البوت. النماذج من قائمة الخدمة المعلنة.")
+                actions = [("فحص جلسة DeepSeek", "account", "shieldcheck"), ("تحديث توكن DeepSeek", "deepseek_token", "lock"),
+                           ("نماذج الخدمة", "models", "adjustments"), ("تحديد نموذج يدويًا", "model", "adjustments"),
+                           ("المحادثات المحفوظة", "chats", "message"),
+                           (f"التفكير: {'مفعّل' if self.config.deepseek_thinking else 'معطّل'}", "thinking", "adjustments")]
             else:
                 self.text(box, "-# النموذج adaptive وحساب Google رقم 1 هما المثبتان في الملف المرفق. قائمة المحادثات هنا تعرض ما حُفظ بهذا البوت أو استوردته بملف حالة.")
                 actions = [("رفع ملف الكوكيز", "cookies", "folderopen"), ("فحص الاتصال", "account", "shieldcheck"),
@@ -251,11 +279,12 @@ class ProviderConsole(discord.ui.LayoutView):
         self.buttons(box, actions)
         box.add_item(discord.ui.Separator())
         if self.provider != "qwen":
-            self.text(box, f"## {{emoji:photo}} دقة الاستخراج\nارتفاع المقطع: `{self.config.ocr_crop_height}px` · التدقيق المزدوج: **{'مفعّل' if self.config.ocr_double_check else 'معطّل'}**\n"
-                          f"حد القراءة المكبّرة: `{self.config.ocr_rescue_limit}` مواضع لكل صفحة\n"
+            self.text(box, "## {emoji:photo} سياسة الصور\nحتى 16000 بكسل: الصورة كاملة كما هي.\n"
+                          "فوق 16000 بكسل: ثلاثة أجزاء فقط، تُرسل معًا في طلب واحد مرتب.\n"
+                          "طلب استخراج واحد عند النجاح؛ إعادة المحاولة تكون عند الفشل فقط.\n"
                           f"النطاق: **{'كل النصوص بما فيها مربعات الحالة والأصوات' if self.config.ocr_scope == 'all' else 'الحوار والسرد ومربعات الحالة بدون الأصوات'}**\n"
                           "حفظ اللغة والحروف الأصلية • ترتيب رأسي • إزالة تكرار التداخل فقط")
-            self.buttons(box, [("حجم المقاطع", "quality", "adjustments"), ("تبديل التدقيق المزدوج", "audit", "circlecheck"), ("نطاق النصوص", "scope", "list"), ("نتيجة آخر اختبار", "report", "chartpie")])
+            self.buttons(box, [("نطاق النصوص", "scope", "list"), ("نتيجة آخر اختبار", "report", "chartpie")])
         self.buttons(box, [("تفعيل هذا المزود", "activate", "circlecheck"), ("تحديث اللوحة", "refresh", "clock"), ("المستخدمون والنقاط", "users", "user")])
         self.add_item(box)
 
@@ -282,7 +311,7 @@ class ProviderConsole(discord.ui.LayoutView):
     async def action(self, interaction, action):
         if not await guard(self.api, interaction):
             return
-        if action in ("token", "message", "open_chat", "quality", "model"):
+        if action in ("token", "deepseek_token", "system_prompt", "urls", "message", "open_chat", "model"):
             await interaction.response.send_modal(TextModal(self, action))
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -297,8 +326,8 @@ class ProviderConsole(discord.ui.LayoutView):
                 _PENDING[self.provider].clear()
             elif action == "clear":
                 _PENDING[self.provider].clear()
-            elif action in ("audit", "scope"):
-                changes = {"ocr_double_check": not config.ocr_double_check} if action == "audit" else {"ocr_scope": "dialogue" if config.ocr_scope == "all" else "all"}
+            elif action in ("thinking", "scope"):
+                changes = {"deepseek_thinking": not config.deepseek_thinking} if action == "thinking" else {"ocr_scope": "dialogue" if config.ocr_scope == "all" else "all"}
                 await asyncio.to_thread(save_processing_config, **changes)
             elif action in ("cookies", "attachment", "import_thread"):
                 await self.receive_file(interaction, action, candidate)
@@ -325,11 +354,16 @@ class ProviderConsole(discord.ui.LayoutView):
                                 f"إصدار التوكن: {stamp(records.get('issued_at'))}\nانتهاؤه: {stamp(records.get('expires_at'))}\n"
                                 f"النماذج المتاحة: `{records['available_models']}`\n"
                                 f"قائمة النماذج: {'متصلة' if records.get('model_list_available') else 'تعذر جلبها؛ يمكن تحديد نموذج يدويًا'}\nلا يتم عرض التوكن نفسه.")
+                    elif self.provider == "deepseek":
+                        body = "جلسة DeepSeek متصلة.\nالنماذج من قائمة الخدمة المعلنة.\nالتوكن محفوظ ولا يُعرض."
+                    elif self.provider == "dark":
+                        body = "الخدمة استجابت للطلب التجريبي." if records.get("connected") else "الخدمة أعادت ردًا غير متوقع."
                     else:
                         body = "جلسة Google متصلة • الحساب `/u/1` • النموذج `adaptive`\nمعرّفات المحادثة محفوظة، والكوكيز لا تُعرض."
                     await interaction.followup.send(embed=self.api.themed_embed("معلومات الحساب الخاصة", body), ephemeral=True)
                 else:
-                    await self.picker(interaction, records, "gemini_chats" if self.provider == "gemini" else action)
+                    picker_action = self.provider + "_chats" if action == "chats" and self.provider in ("gemini", "deepseek") else action
+                    await self.picker(interaction, records, picker_action)
                     return
             elif action == "qwen_accounts":
                 data = await asyncio.to_thread(self.api.load_accounts_data, self.api.OWNER_ID)
@@ -384,10 +418,11 @@ class ProviderConsole(discord.ui.LayoutView):
                 is_image = (attachment.content_type or "").startswith("image/") or attachment.filename.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif"))
                 prompt = (message.content or "").strip()
                 if not prompt:
-                    if len(_PENDING[provider]) >= 5:
-                        raise ValueError("خمسة مرفقات كحد أقصى")
+                    if len(_PENDING[provider]) >= (10 if provider == "dark" else 5):
+                        raise ValueError("عدد المرفقات تجاوز الحد المسموح")
                     _PENDING[provider].append((data, attachment.filename, is_image))
-                    await dm.send("أضيف المرفق. أرسل سؤالك من زر رسالة تجريبية في /zx، أو امسح المرفقات من اللوحة.")
+                    button_label = "طلب نصي" if provider == "dark" else "رسالة تجريبية"
+                    await dm.send(f"أضيف المرفق. أرسل سؤالك من زر {button_label} في /zx، أو امسح المرفقات من اللوحة.")
                     return
                 answer = await asyncio.to_thread(complete_external, provider, prompt,
                     [(data, attachment.filename)] if is_image else (), files=() if is_image else [(data, attachment.filename)], config=config)

@@ -1,10 +1,12 @@
 import asyncio
+import io
 import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import bot
+from PIL import Image
 from utils.storage import _normalize_profile
 from utils.providers import ProcessingConfig, selected_provider, snapshot_processing_settings
 
@@ -41,6 +43,34 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(bot.request_text_completion(1, "prompt"), "translation")
             qwen.assert_called_once()
             external.assert_not_called()
+
+    def test_qwen_obeys_the_same_16000_threshold_and_three_part_batch(self):
+        settings = {"_processing_config": ProcessingConfig(provider="qwen")}
+        for height in (16000, 16001):
+            output = io.BytesIO()
+            Image.new("RGB", (32, height), "white").save(output, format="PNG")
+            with patch.object(bot, "_extract_tiles_batched", return_value="batched", autospec=True) as batch, \
+                    patch.object(bot, "_do_single_extraction", return_value=("whole", None)) as whole:
+                result = bot.extract_text_from_single_image(1, output.getvalue(), "page.png", False, settings)
+            if height == 16000:
+                whole.assert_called_once()
+                batch.assert_not_called()
+                self.assertEqual(result, "whole")
+            else:
+                whole.assert_not_called()
+                batch.assert_called_once()
+                self.assertEqual(len(batch.call_args.args[1]), 3)
+                self.assertEqual(result, "batched")
+
+    def test_failed_qwen_batch_does_not_fall_back_to_extra_full_or_subdivided_images(self):
+        output = io.BytesIO()
+        Image.new("RGB", (32, 18000), "white").save(output, format="PNG")
+        with patch.object(bot, "_extract_tiles_batched", side_effect=RuntimeError("failed"), autospec=True), \
+                patch.object(bot, "_do_single_extraction") as whole:
+            with self.assertRaises(RuntimeError):
+                bot.extract_text_from_single_image(1, output.getvalue(), "page.png", False,
+                                                   {"_processing_config": ProcessingConfig(provider="qwen")})
+        whole.assert_not_called()
 
     def test_batch_routes_images_in_order(self):
         images = [(b"first", "01.png"), (b"second", "02.png")]

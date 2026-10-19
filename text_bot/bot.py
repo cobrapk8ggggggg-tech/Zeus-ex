@@ -35,7 +35,7 @@ BOT_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "656783724662226963"))
 TEMP_API_URL = os.getenv("TEMP_API_URL", "").rstrip("/")
 BASE_QWEN_URL = os.getenv("BASE_QWEN_URL", "https://chat.qwen.ai/api/v2").rstrip("/")
-BOT_VERSION = os.getenv("BOT_VERSION", "3.0.0")
+BOT_VERSION = os.getenv("BOT_VERSION", "3.1.0")
 GDRIVE_API_KEY = os.getenv("GDRIVE_API_KEY", "").strip()
 
 MAX_IMAGES_PER_REQUEST = int(os.getenv("MAX_IMAGES_PER_REQUEST", "10"))
@@ -52,16 +52,15 @@ MAX_RETRY_PER_IMAGE = int(os.getenv("MAX_RETRY_PER_IMAGE", "3"))
 EXTRACTION_CONCURRENCY = max(1, int(os.getenv("EXTRACTION_CONCURRENCY", "2")))
 
 # التقسيم الذكي للصور الشريطية الطويلة (فصول المانهوا المدموجة عموديًا)
-# لا تقسيم استباقي أبدًا: الصورة تُجرّب كاملة أولًا في الوضعين،
-# وعند الفشل بسبب الطول فقط تُقسّم إلى أجزاء متساوية بحد أقصى TILE_MAX_PARTS
-# مع تداخل TILE_OVERLAP حتى لا تنقطع فقاعة حوار عند الحدود.
-TILE_MAX_EDGE = int(os.getenv("TILE_MAX_EDGE", "6000"))         # عتبة اعتبار الصورة شريطًا طويلًا
+# الصورة حتى 16000 بكسل تُرسل كاملة، والأطول تُرسل كثلاثة أجزاء معًا.
+# التداخل سياق للفقاعات التي تقع على الحدود، ولا يزيد عدد الأجزاء.
+TILE_MAX_EDGE = 16000  # الصور الأقصر تُرسل كاملة؛ سياسة المالك الحالية
 TILE_HEIGHT = int(os.getenv("TILE_HEIGHT", "3200"))            # الارتفاع المستهدف للجزء الواحد
-TILE_MAX_PARTS = max(2, int(os.getenv("TILE_MAX_PARTS", "3")))  # أقصى عدد أجزاء للصورة كاملة
+TILE_MAX_PARTS = 3
 TILE_OVERLAP = int(os.getenv("TILE_OVERLAP", "320"))
 TILE_MAX_RETRIES = int(os.getenv("TILE_MAX_RETRIES", "2"))
-# الجزء الذي ما زال طويلًا وفشل وحده يُعاد تقسيمه وحده مرة واحدة (ضمان نادر للصفحات العملاقة)
-TILE_SUB_SPLIT_DEPTH = max(0, int(os.getenv("TILE_SUB_SPLIT_DEPTH", "1")))
+# إعادة تقسيم الأجزاء معطلة؛ الحد ثابت بثلاث قطع.
+TILE_SUB_SPLIT_DEPTH = 0  # لا تقسيم إضافي يتجاوز الأجزاء الثلاثة
 
 # المراجعة الآلية بعد الترجمة — أي مقاطع أجنبية متبقية (إنجليزي/كوري/صيني...)
 # في النص المُترجم تُكتشف آليًا وتُترجم وتُلصق مكانها، وحروف التصنيف (A, S, SS, C) تبقى كما هي.
@@ -168,7 +167,7 @@ def fmt_bool(value):
 _ERROR_REDACTIONS = [
     (re.compile(r"https?://\S+", re.I), "رابط خارجي"),
     (re.compile(r"\bqwen[\w.-]*", re.I), "محرك المعالجة"),
-    (re.compile(r"\b(?:gemini|chatgpt|gpt|openai|google)[\w.-]*", re.I), "محرك المعالجة"),
+    (re.compile(r"\b(?:gemini|chatgpt|gpt|openai|google|deepseek|dark)[\w.-]*", re.I), "محرك المعالجة"),
     (re.compile(r"\bocr\b", re.I), "المعالجة"),
     (re.compile(r"\btokens?\b", re.I), "بيانات الاتصال"),
     (re.compile(r"\bBearer\s+\S+", re.I), "بيانات الاتصال"),
@@ -2445,14 +2444,14 @@ def choose_tile_part_count(height):
     """عدد الأجزاء المناسب لصورة طولها معيّن — لا يتجاوز TILE_MAX_PARTS أبدًا."""
     if height <= TILE_MAX_EDGE:
         return 1
-    return min(TILE_MAX_PARTS, max(2, -(-height // TILE_HEIGHT)))
+    return 3
 
 
 def split_long_image(image_bytes):
     """
     يقسم الصورة الشريطية الطويلة إلى أجزاء متساوية قابلة للقراءة
     بحد أقصى TILE_MAX_PARTS أجزاء (ثلاثة فقط — لا سبعة).
-    يُستدعى فقط بعد فشل الصورة كاملة بسبب طولها — ليس خطوة افتراضية أبدًا.
+    يُستدعى مباشرة فقط عندما يتجاوز الطول 16000 بكسل.
     يعيد قائمة (bytes, label, height) — بعنصر واحد إذا كانت الصورة عادية لا تحتاج تقسيمًا.
     """
     img = Image.open(io.BytesIO(image_bytes))
@@ -2750,9 +2749,8 @@ def _extract_tiled_sequential(user_id, tiles, thinking_enabled, settings, *, dep
 def extract_text_from_single_image(user_id, image_bytes, image_name, thinking_enabled, settings=None, chat_id=None, progress_cb=None):
     """
     استخراج كامل الدورة لصورة واحدة:
-    1) الصورة تُجرّب كاملة أولًا دائمًا في الوضعين — لا تقسيم استباقي أبدًا.
-    2) فقط إذا فشلت الصورة الطويلة بسبب طولها (خطأ تقني أو إعلان No غير قابل للتصديق)
-       تُقسّم إلى حد أقصى TILE_MAX_PARTS أجزاء ويُدمج نصها.
+    1) حتى 16000 بكسل: الصورة كاملة. فوق ذلك: ثلاثة أجزاء في طلب مرتب واحد.
+    2) تعاد المحاولة عند الفشل فقط، ولا تعاد تقسيم الأجزاء.
     3) الفشل التقني الحقيقي يرفع استثناءً ليستلمه خط الأنابيب في مرحلة الإنقاذ.
     4) الناتج يبقى دائمًا باللغة الأصلية كما في الصورة — لا ترجمة هنا إطلاقًا
        (الترجمة والمراجعة الآلية تحدث لاحقًا على مخرجات الترجمة فقط).
@@ -2763,16 +2761,17 @@ def extract_text_from_single_image(user_id, image_bytes, image_name, thinking_en
     if config.provider != "qwen":
         from utils.vision_ocr import extract_page
         return extract_page(image_bytes, image_name, config,
-                            bubble_spacing=(settings or {}).get("bubble_spacing", True), progress=progress_cb)
+                            bubble_spacing=(settings or {}).get("bubble_spacing", True), progress=progress_cb,
+                            thinking_enabled=thinking_enabled)
     last_error = None
 
-    # هل الصورة شريطًا طويلًا؟ (فقط الطويلة هي المرشحة للتقسيم عند الفشل)
-    long_image = False
     try:
         _, img_height = get_image_dimensions(image_bytes)
-        long_image = img_height > TILE_MAX_EDGE
     except Exception:
-        long_image = False
+        img_height = 0
+    if img_height > TILE_MAX_EDGE:
+        return _extract_tiles_batched(user_id, split_long_image(image_bytes), thinking_enabled, settings,
+                                      progress_cb=progress_cb, display_name=image_name, label_prefix="")
 
     for attempt in range(1, MAX_RETRY_PER_IMAGE + 1):
         chat_id_used = None
@@ -2785,10 +2784,6 @@ def extract_text_from_single_image(user_id, image_bytes, image_name, thinking_en
             if cleaned != _EXTRACTION_FAILED_MARKER:
                 return cleaned  # نص أصلي خام — لا مراجعة ولا ترجمة هنا
             last_error = None  # إعلان (No) موثّق — ليس خطأ تقنيًا
-            if long_image:
-                # صورة طويلة أُعلن (No) عليها؟ الرد غير قابل للوثيق لأن الصورة
-                # تُضغط بعنف — انتقال مباشر للتقسيم بدل حرق المحاولات عبثًا.
-                break
         except Exception as exc:
             last_error = exc
         finally:
@@ -2796,27 +2791,6 @@ def extract_text_from_single_image(user_id, image_bytes, image_name, thinking_en
         if attempt < MAX_RETRY_PER_IMAGE:
             time.sleep(2 * attempt)
             chat_id = None
-
-    # خطة التقسيم الذكي — فقط للصور الطويلة التي فشلت فعلاً (في الوضعين)
-    if long_image:
-        if progress_cb:
-            try:
-                progress_cb("split_start", image_name, 0, 0, "")
-            except Exception:
-                pass
-        try:
-            tiles = split_long_image(image_bytes)
-        except Exception:
-            tiles = []
-        if len(tiles) > 1:
-            merged = _extract_tiled(
-                user_id, tiles, True, settings,
-                progress_cb=progress_cb, display_name=image_name,
-            )
-            if merged.strip():
-                return merged  # نص أصلي خام — لا مراجعة ولا ترجمة هنا
-            # حتى مع التقسيم: لا نص إطلاقًا — صورة فارغة مؤكدة
-            return ""
 
     if last_error is not None:
         raise last_error
@@ -4088,6 +4062,13 @@ def profile_embed(user, profile):
 @bot.event
 async def on_ready():
     print(emojize(f"{emoji_manager.placeholder('circlecheck')} ZEUS text bot جاهز (v{BOT_VERSION})"))
+    if os.getenv("PUBLIC_FILE_BASE_URL") or os.getenv("RAILWAY_PUBLIC_DOMAIN"):
+        try:
+            from utils.file_links import start_file_server
+            await asyncio.to_thread(start_file_server)
+            print("[FileLinks] Temporary attachment service ready.")
+        except Exception:
+            print("[FileLinks] Temporary attachment service unavailable.")
     try:
         synced = await bot.tree.sync()
         print(f"تمت مزامنة {len(synced)} أمر.")
@@ -4095,12 +4076,15 @@ async def on_ready():
         print(f"فشل مزامنة الأوامر: {e}")
     marker = os.getenv("ZEUS_VALIDATION_RUN", "").strip()
     folder = os.getenv("ZEUS_VALIDATION_FOLDER", "").strip()
-    if marker and re.fullmatch(r"[A-Za-z0-9_-]{10,100}", folder) and not getattr(bot, "_validation_started", False):
+    mode = os.getenv("ZEUS_VALIDATION_MODE", "full")
+    if marker and (mode == "batch" or re.fullmatch(r"[A-Za-z0-9_-]{10,100}", folder)) and not getattr(bot, "_validation_started", False):
         bot._validation_started = True
-        from utils.live_validation import run_validation
-        mode = os.getenv("ZEUS_VALIDATION_MODE", "full")
-        mode = mode if mode in ("accounts", "focused") else "full"
-        bot._validation_task = asyncio.create_task(asyncio.to_thread(run_validation, sys.modules[__name__], marker, folder, mode))
+        from utils.live_validation import run_validation, run_batch_validation
+        if mode == "batch":
+            bot._validation_task = asyncio.create_task(asyncio.to_thread(run_batch_validation, sys.modules[__name__], marker))
+        else:
+            mode = mode if mode in ("accounts", "focused") else "full"
+            bot._validation_task = asyncio.create_task(asyncio.to_thread(run_validation, sys.modules[__name__], marker, folder, mode))
     # نظام الإيموجي المخصص:
     # - يُحمّل أولاً من utils/emojis.json إذا كان مطابقًا لتطبيق هذا البوت.
     # - إذا كانت الخريطة فارغة (لا إيموجيات مخصصة) تُجبر المزامنة على العمل

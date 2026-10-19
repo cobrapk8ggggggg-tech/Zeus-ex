@@ -278,5 +278,81 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn("private server detail", str(raised.exception))
 
 
+class AdditionalProviderTests(unittest.TestCase):
+    setUp = ProviderTests.setUp
+    @patch("utils.providers.requests.Session")
+    def test_dark_stream_chunks_preserve_unicode_and_ten_urls(self, factory):
+        config = providers.ProcessingConfig(provider="dark", dark_system_prompt="Literal OCR")
+        factory.return_value.post.return_value = response(lines=[
+            b'data: {"text":"FIRST\\n"}', b"",
+            'data: {"text":"中文"}'.encode(), b"",
+            b'data: {"done":true}', b"",
+        ])
+        urls = [f"https://example.test/{i}.png" for i in range(10)]
+        with patch("utils.providers.load_provider_thread", side_effect=AssertionError("stateless API")):
+            answer = providers.complete_external("dark", "extract", file_urls=urls, config=config)
+        self.assertEqual(answer, "FIRST\n中文")
+        body = factory.return_value.post.call_args.kwargs["json"]
+        self.assertEqual(body["file_urls"], urls)
+        self.assertEqual(body["system_prompt"], "Literal OCR")
+        factory.return_value.post.reset_mock()
+        with self.assertRaises(providers.ProviderConfigurationError):
+            providers.complete_external("dark", "extract", file_urls=urls + urls[:1], config=config)
+        factory.return_value.post.assert_not_called()
+
+    @patch("utils.providers.requests.Session")
+    def test_dark_stream_without_completion_marker_never_delivers_partial_text(self, factory):
+        factory.return_value.post.return_value = response(lines=[b'data: {"text":"partial"}', b""])
+        with self.assertRaises(RuntimeError):
+            providers.complete_external("dark", "extract", config=providers.ProcessingConfig(provider="dark"))
+
+    @patch("utils.providers.requests.Session")
+    def test_dark_byte_attachments_get_ordered_temporary_links(self, factory):
+        factory.return_value.post.return_value = response(lines=[b'data: {"text":"ok"}', b"", b'data: {"done":true}', b""])
+        links = ["https://files.test/assets/one", "https://files.test/assets/two"]
+        with patch("utils.file_links.temporary_links") as lease:
+            lease.return_value.__enter__.return_value = links
+            providers.complete_external("dark", "extract", [(image_bytes(), "1.png"), (image_bytes(), "2.png")],
+                                        config=providers.ProcessingConfig(provider="dark"))
+        self.assertEqual(factory.return_value.post.call_args.kwargs["json"]["file_urls"], links)
+        lease.return_value.__exit__.assert_called_once()
+
+    @patch("utils.providers.requests.Session")
+    def test_deepseek_images_and_parent_state_continue_in_the_same_session(self, factory):
+        factory.return_value.post.side_effect = [
+            response(data={"session_id": "deep-session", "parent_message_id": 2, "response": "FIRST"}),
+            response(data={"session_id": "deep-session", "parent_message_id": 4, "response": "NEXT"}),
+        ]
+        config = providers.ProcessingConfig(provider="deepseek", deepseek_token="private-test-token")
+        providers.complete_external("deepseek", "extract", [(image_bytes(), "one.png")], config=config)
+        first = factory.return_value.post.call_args.kwargs["json"]
+        self.assertEqual(len(first["files"]), 1)
+        self.assertTrue(first["files"][0]["file_data"].startswith("data:image/png;base64,"))
+        self.assertFalse(first["thinking_enabled"])
+        providers.complete_external("deepseek", "continue", config=config)
+        second = factory.return_value.post.call_args.kwargs["json"]
+        self.assertEqual(second["session_id"], "deep-session")
+        self.assertEqual(second["parent_message_id"], 2)
+        self.assertEqual(self.states["deepseek"]["parent_message_id"], 4)
+        self.assertNotIn(config.deepseek_token, repr(config))
+        self.assertNotIn(config.deepseek_token, str(self.states))
+
+    @patch("utils.providers.requests.Session")
+    def test_deepseek_cannot_silently_switch_session_or_token(self, factory):
+        self.states["deepseek"] = {"conversation_id": "chosen", "parent_message_id": 6}
+        factory.return_value.post.return_value = response(data={"session_id": "other", "parent_message_id": 2, "response": "bad"})
+        config = providers.ProcessingConfig(provider="deepseek", deepseek_token="private-test-token")
+        with self.assertRaises(providers.ProviderConfigurationError):
+            providers.complete_external("deepseek", "continue", config=config)
+        self.assertEqual(self.states["deepseek"]["conversation_id"], "chosen")
+
+    @patch("utils.providers.requests.Session")
+    def test_deepseek_error_body_cannot_leak_token(self, factory):
+        config = providers.ProcessingConfig(provider="deepseek", deepseek_token="do-not-display")
+        factory.return_value.post.return_value = response(data={"error": config.deepseek_token})
+        with self.assertRaises(RuntimeError) as caught:
+            providers.complete_external("deepseek", "extract", config=config, max_attempts=1)
+        self.assertNotIn(config.deepseek_token, str(caught.exception))
+
 if __name__ == "__main__":
     unittest.main()

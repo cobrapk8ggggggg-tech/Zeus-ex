@@ -63,8 +63,7 @@ def run_validation(api, marker, folder, mode="full"):
     try:
         config = get_processing_config()
         report["model"] = config.chatgpt_model
-        report["ocr_settings"] = {key: getattr(config, key) for key in
-                                  ("ocr_crop_height", "ocr_double_check", "ocr_scope", "ocr_rescue_limit")}
+        report["ocr_settings"] = {"split_threshold": 16000, "max_parts": 3, "scope": config.ocr_scope}
         for provider, configured in (("gpt", bool(config.chatgpt_access_token)), ("gemini", bool(config.gemini_cookie_header))):
             if not configured:
                 report["accounts"][provider] = {"status": "not_configured"}
@@ -169,6 +168,8 @@ def latest_report():
     report = runs.find_one({"pages.0": {"$exists": True}}, {"_id": 0}, sort=[("started_at", -1)])
     report = report or runs.find_one({}, {"_id": 0}, sort=[("started_at", -1)])
     if report:
+        if report.get("mode") == "batch":
+            return report
         for page in report.get("pages", []):
             page["checks"] = [{"reference": ref, "found": normalized(ref) in normalized(page["text"])}
                               for ref in GOLDEN.get(page["name"], [])]
@@ -179,3 +180,108 @@ def latest_report():
         if focus:
             report["focused_recheck"] = focus
     return report
+
+
+def run_batch_validation(api, marker):
+    """Measure the new one-request policy and URL/file adapters on real services."""
+    import uuid
+    from utils.file_links import temporary_links
+    from utils.vision_ocr import SPLIT_THRESHOLD, MAX_PARTS
+    collection = _get_db().validation_runs
+    report = collection.find_one({"_id": marker})
+    if report and report.get("status") != "running":
+        return
+    if report:
+        time.sleep(20)
+    else:
+        expected = [label + " " + str(10000 + uuid.uuid4().int % 90000)
+                    for label in ("FIRST PANEL", "SECOND PANEL", "LAST PANEL")]
+        report = {"_id": marker, "mode": "batch", "started_at": int(time.time()),
+                  "status": "running", "expected_lines": expected, "pages": [],
+                  "conversation_checks": {}, "policy": {"split_threshold": SPLIT_THRESHOLD, "max_parts": MAX_PARTS}}
+        collection.insert_one(report)
+    def save():
+        collection.update_one({"_id": marker}, {"$set": {k: v for k, v in report.items() if k != "_id"}})
+    config = get_processing_config()
+    expected = report["expected_lines"]
+    def fixture(height, positions):
+        im = Image.new("RGB", (760, height), "white")
+        draw = ImageDraw.Draw(im)
+        font = ImageFont.truetype(str(api.BASE_DIR / "assets/fonts/Montserrat-Bold.ttf"), 44)
+        for line, y in zip(expected, positions):
+            draw.text((20, y), line, font=font, fill="black")
+        out = io.BytesIO()
+        im.save(out, format="PNG")
+        return out.getvalue()
+    small = fixture(400, (25, 145, 265))
+    long = fixture(18000, (250, 8900, 17400))
+    def evaluate(text):
+        norm = normalized(text)
+        positions = [norm.find(normalized(line)) for line in expected]
+        return all(n >= 0 for n in positions) and positions == sorted(positions)
+    print("[ZEUS_BATCH] " + json.dumps({"run": marker, "event": "started", "policy": report["policy"]}), flush=True)
+    try:
+        for provider, configured in (("gpt", bool(config.chatgpt_access_token)),
+                                     ("dark", True), ("deepseek", bool(config.deepseek_token))):
+            if not configured:
+                report.setdefault("skipped", []).append(provider)
+                continue
+            candidate = replace(config, provider=provider)
+            initial = provider_thread(provider).get("conversation_id") if provider != "dark" else None
+            conversation = initial
+            for label, data, count in (("small", small, 1), ("long", long, 3)):
+                name = provider + "-" + label + ".png"
+                if any(page["name"] == name for page in report["pages"]):
+                    continue
+                calls = []
+                def diagnostics(detail):
+                    calls.append(detail)
+                started = time.monotonic()
+                row = {"name": name, "provider": provider, "expected_attachments": count}
+                try:
+                    text = extract_page(data, name, candidate, diagnostics=diagnostics)
+                    row.update(text=text, correct_text_and_order=evaluate(text),
+                               requests=len(calls), attachments=[c["attachments"] for c in calls])
+                    row["passed"] = row["correct_text_and_order"] and len(calls) == 1 and calls[0]["attachments"] == count
+                    if provider != "dark":
+                        cid = provider_thread(provider).get("conversation_id")
+                        conversation = conversation or cid
+                        report["conversation_checks"][provider] = bool(cid and cid == conversation) and report["conversation_checks"].get(provider, True)
+                except Exception as exc:
+                    row.update(text="", passed=False, error=api.sanitize_error(exc), requests=len(calls))
+                row["seconds"] = round(time.monotonic() - started, 1)
+                report["pages"].append(row)
+                save()
+                print("[ZEUS_BATCH] " + json.dumps({k: v for k, v in row.items() if k != "text"}, ensure_ascii=False), flush=True)
+        if "url_lifecycle" not in report:
+            candidate = replace(config, provider="dark")
+            with temporary_links([(small, "fixture.png")]) as urls:
+                during = requests.get(urls[0], timeout=30).status_code
+                answer = complete_external("dark", "Copy every printed line in top-to-bottom order. Return text only.",
+                                           file_urls=urls, config=candidate, max_attempts=1)
+                url = urls[0]
+            after = requests.get(url, timeout=30).status_code
+            report["url_lifecycle"] = {"during": during, "after": after, "ocr_correct": evaluate(answer),
+                                       "passed": during == 200 and after == 404 and evaluate(answer)}
+            save()
+        if "pdf_attachment" not in report:
+            pdf = io.BytesIO()
+            with Image.open(io.BytesIO(small)) as im:
+                im.convert("RGB").save(pdf, format="PDF", resolution=120)
+            answer = complete_external("dark", "Copy every printed line in this PDF in top-to-bottom order. Return text only.",
+                                       files=[(pdf.getvalue(), "fixture.pdf")], config=replace(config, provider="dark"), max_attempts=1)
+            report["pdf_attachment"] = {"passed": evaluate(answer), "text": answer}
+            save()
+        passed = all(p["passed"] for p in report["pages"]) and all(report["conversation_checks"].values())
+        passed &= report.get("url_lifecycle", {}).get("passed", False) and report.get("pdf_attachment", {}).get("passed", False)
+        report["status"] = "completed" if passed else "completed_with_failures"
+    except Exception as exc:
+        report.update(status="failed", error=api.sanitize_error(exc))
+    finally:
+        report["finished_at"] = int(time.time())
+        save()
+        print("[ZEUS_BATCH_RESULT] " + json.dumps({
+            **{k: v for k, v in report.items() if k not in ("pages", "_id", "pdf_attachment")},
+            "pages": [{k: v for k, v in page.items() if k != "text"} for page in report["pages"]],
+            "pdf_attachment": {"passed": report.get("pdf_attachment", {}).get("passed")}
+        }, ensure_ascii=False), flush=True)
