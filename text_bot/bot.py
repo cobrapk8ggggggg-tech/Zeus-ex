@@ -3332,6 +3332,9 @@ def extract_page_with_fallback(user_id, image_bytes, image_name, thinking_enable
     """
     from utils.providers import PROVIDER_LOCKS, new_thread
     config = processing_config(settings)
+    recovery = (settings or {}).get("_recovery_state")
+    if recovery:
+        config = replace(config, provider=recovery["preferred"])
     available = [(config.provider, config)]
     for provider in ("gpt", "gemini", "deepseek", "dark", "qwen"):
         if provider == config.provider:
@@ -3359,12 +3362,15 @@ def extract_page_with_fallback(user_id, image_bytes, image_name, thinking_enable
                                 pass
                             else:
                                 new_thread(provider, config=candidate)
-                        return extract_text_from_single_image(user_id, image_bytes, image_name,
+                        text = extract_text_from_single_image(user_id, image_bytes, image_name,
                             thinking_enabled if supports_thinking(provider) else False,
                             attempt_settings, progress_cb=progress_cb)
                 else:
-                    return extract_text_from_single_image(user_id, image_bytes, image_name,
+                    text = extract_text_from_single_image(user_id, image_bytes, image_name,
                         thinking_enabled, attempt_settings, progress_cb=progress_cb)
+                if recovery is not None:
+                    recovery["preferred"] = provider
+                return text
             except Exception as exc:
                 last_error = exc
                 if progress_cb:
@@ -3374,6 +3380,8 @@ def extract_page_with_fallback(user_id, image_bytes, image_name, thinking_enable
 
 async def run_extraction_pipeline(status_msg, user_id, images, thinking_enabled, settings):
     """Process every page with bounded fresh-thread recovery and provider fallback."""
+    settings = dict(settings or {})
+    settings["_recovery_state"] = {"preferred": selected_provider(settings)}
     total_images = len(images)
     page_texts = {}
     failed_notices = {}

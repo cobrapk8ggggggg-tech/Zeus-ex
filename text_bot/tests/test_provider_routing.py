@@ -266,3 +266,21 @@ class CapabilityAndSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("تعذر استخراج",text)
         self.assertLess(text.index("FIRST"),text.index("02.png"))
         self.assertLess(text.index("02.png"),text.index("LAST"))
+
+class ChapterRecoveryStateTests(unittest.TestCase):
+    def test_rest_of_chapter_keeps_working_backup_without_changing_global_selection(self):
+        config=ProcessingConfig(provider="deepseek",deepseek_token="test",gemini_cookie_header="SID=test")
+        settings={"_processing_config":config,"_recovery_state":{"preferred":"deepseek"}}
+        providers=[]
+        def extract(user,data,name,thinking,current,**kw):
+            p=current["_processing_config"].provider;providers.append(p)
+            if p=="deepseek":raise RuntimeError("offline")
+            return "SOURCE"
+        with patch.object(bot,"load_accounts_data",return_value={"accounts":[]}), \
+             patch.object(bot,"extract_text_from_single_image",side_effect=extract), \
+             patch("utils.providers.new_thread"):
+            for name in ("01.png","02.png"):
+                self.assertEqual(bot.extract_page_with_fallback(1,b"image",name,False,settings),"SOURCE")
+        self.assertEqual(providers,["deepseek","deepseek","gemini","gemini"])
+        self.assertEqual(settings["_processing_config"].provider,"deepseek")
+        self.assertEqual(settings["_recovery_state"]["preferred"],"gemini")

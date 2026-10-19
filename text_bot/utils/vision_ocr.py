@@ -125,6 +125,8 @@ def unwrap_response(raw):
         return payload
     if not text or text.startswith(("{", "[")):
         raise RuntimeError("رد الاستخراج فارغ أو JSON غير مكتمل.")
+    if re.fullmatch(r"(?:I seem to be encountering an error\.\s*Can I try something else for you\?|Something went wrong\.?\s*Please try again\.?)", text, re.I):
+        raise RuntimeError("المزود أعاد رسالة تعثر بدل نص الصورة.")
     if re.search(r"(?:I (?:cannot|can't|am unable to)|unable to)\s+(?:read|view|access|see|process)\s+(?:(?:the|this|an?|your|attached)\s+){0,3}(?:image|file|attachment|picture)|(?:no image (?:was |is )?(?:provided|attached))|(?:لا (?:أستطيع|يمكنني)|تعذر)\s+(?:عرض|قراءة|رؤية)\s+(?:الصورة|الملف|المرفق)", text, re.I):
         raise RuntimeError("لم يتمكن المزود من قراءة المرفق.")
     return text

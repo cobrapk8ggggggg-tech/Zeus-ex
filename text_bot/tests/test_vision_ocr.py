@@ -173,3 +173,11 @@ class FlexibleResponseTests(unittest.TestCase):
         raw='{"parts":[{"part":1,"regions":[{"text:FIRST,box":[3,4,110,22],"kind:caption,illegible":false}]},{"part":2,"regions":[{"text:SECOND,box":[1,4,110,22],"kind:caption,illegible":false}]},{"part":3,"regions":[{"text:LAST,box":[1,3,110,22],"kind:caption,illegible":false}]}]}'
         with patch("utils.vision_ocr.complete_external",return_value=raw):
             self.assertEqual(extract_page(sample(18000),"page.png",ProcessingConfig(provider="dark")),"FIRST\n\nSECOND\n\nLAST")
+
+    def test_real_gemini_error_message_is_retried_instead_of_becoming_page_text(self):
+        error="I seem to be encountering an error. Can I try something else for you?"
+        with self.assertRaises(RuntimeError):
+            parse_parts(error,1)
+        # The same words inside literal structured OCR can be actual dialogue.
+        raw=batch([(1,[region(error)])])
+        self.assertEqual(parse_parts(raw,1)[0][0]["text"],error)
