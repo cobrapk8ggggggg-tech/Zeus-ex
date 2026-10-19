@@ -70,14 +70,15 @@ def import_owner_cookie_file():
     marker = os.getenv("ZEUS_IMPORT_GEMINI_COOKIES", "")
     header = os.getenv("GEMINI_COOKIE_HEADER", "")
     if not marker or not header:
-        return
+        return False
     saved = load_processing_config()
     if saved.get("gemini_cookie_import") == marker:
-        return
+        return False
     clean = parse_cookie_file(header.encode())
     if hashlib.sha256(clean.encode()).hexdigest() != marker:
         raise ProviderConfigurationError("ملف استيراد الكوكيز غير متطابق.")
     save_processing_config(gemini_cookie_header=clean, gemini_cookie_import=marker)
+    return True
 
 
 def processing_config(settings=None):
@@ -603,7 +604,34 @@ class DarkOCRClient:
             answer = "".join(pieces).strip()
             if not answer:
                 raise RuntimeError("استجابة فارغة من محرك المعالجة.")
+            if re.fullmatch(r"Something went wrong\.?\s*Please try again\.?", answer, re.I):
+                raise RuntimeError("تعذر إكمال طلب GPT-OCR لدى الخدمة؛ ستُستخدم إعادة المحاولة.")
             return answer
+
+    @staticmethod
+    def pdf_pages(data, name, remaining):
+        # The endpoint currently returns an upstream error for scanned PDFs.
+        # Render their original pages locally, then submit ordinary image URLs.
+        import pypdfium2 as pdfium
+        pages = []
+        with pdfium.PdfDocument(data) as document:
+            if not 0 < len(document) <= remaining:
+                raise ProviderConfigurationError("PDF المصوّر يحتاج أكثر من عشرة مرفقات صور. قسّمه إلى ملفات أصغر.")
+            for index in range(len(document)):
+                page = document[index]
+                try:
+                    bitmap = page.render(scale=2)
+                    try:
+                        image = bitmap.to_pil()
+                        output = io.BytesIO()
+                        image.save(output, format="PNG")
+                        image.close()
+                    finally:
+                        bitmap.close()
+                finally:
+                    page.close()
+                pages.append((output.getvalue(), f"{Path(name).stem}.page-{index + 1:04}.png"))
+        return pages
 
     def complete(self, prompt, images, files=(), file_urls=()):
         from urllib.parse import urlsplit
@@ -618,7 +646,11 @@ class DarkOCRClient:
         for data, name in images:
             data, name, _, _, _ = _image_info(data, name)
             attachments.append((data, name))
-        attachments.extend(files)
+        for data, name in files:
+            if data.lstrip().startswith(b"%PDF-"):
+                attachments.extend(self.pdf_pages(data, name, 10 - len(attachments) - len(urls)))
+            else:
+                attachments.append((data, name))
         if not attachments:
             return self._request(prompt, urls)
         from utils.file_links import temporary_links

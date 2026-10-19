@@ -184,3 +184,23 @@ class AnchorTests(unittest.IsolatedAsyncioTestCase):
         interaction.followup.send.assert_awaited_once()
         self.assertNotIn("view", interaction.followup.send.call_args.kwargs)
         self.assertIn("تم إنشاء", interaction.followup.send.call_args.args[0])
+
+class CookieImportTests(unittest.TestCase):
+    def test_supplied_cookie_import_is_saved_once_and_does_not_override_later_upload(self):
+        import os,hashlib
+        from unittest.mock import MagicMock
+        from utils.providers import import_owner_cookie_file
+        from utils import storage
+        header="SID=owner-cookie; __Secure-1PSID=owner-secure-cookie"
+        marker=hashlib.sha256(header.encode()).hexdigest()
+        db=SimpleNamespace(bot_settings=SimpleNamespace(update_one=MagicMock()))
+        with patch.dict(os.environ,{"GEMINI_COOKIE_HEADER":header,"ZEUS_IMPORT_GEMINI_COOKIES":marker}), \
+             patch("utils.providers.load_processing_config",return_value={}) as load, \
+             patch.object(storage,"_get_db",return_value=db):
+            import_owner_cookie_file()
+            values=db.bot_settings.update_one.call_args.args[1]["$set"]
+            self.assertEqual(values["gemini_cookie_header"],header)
+            self.assertEqual(values["gemini_cookie_import"],marker)
+            load.return_value={"gemini_cookie_import":marker,"gemini_cookie_header":"SID=later-upload"}
+            import_owner_cookie_file()
+        db.bot_settings.update_one.assert_called_once()

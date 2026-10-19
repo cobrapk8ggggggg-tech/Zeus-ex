@@ -222,7 +222,9 @@ def run_batch_validation(api, marker):
     print("[ZEUS_BATCH] " + json.dumps({"run": marker, "event": "started", "policy": report["policy"]}), flush=True)
     previous = collection.find_one({"mode": "batch", "_id": {"$ne": marker}, "pdf_attachment": {"$exists": True}}, sort=[("started_at", -1)])
     if previous:
-        print("[ZEUS_DARK_PDF_FIXTURE] " + json.dumps(previous["pdf_attachment"], ensure_ascii=False), flush=True)
+        for page in previous.get("pages", []):
+            if page.get("provider") == "gemini" and not page.get("passed") and page.get("raw"):
+                print("[ZEUS_GEMINI_FIXTURE] " + json.dumps({"page": page["name"], "response": page["raw"]}, ensure_ascii=False), flush=True)
     try:
         for provider, configured in (("gpt", bool(config.chatgpt_access_token)),
                                      ("gemini", bool(config.gemini_cookie_header)), ("dark", True), ("deepseek", bool(config.deepseek_token))):
@@ -246,14 +248,19 @@ def run_batch_validation(api, marker):
                 started = time.monotonic()
                 row = {"name": name, "provider": provider, "expected_attachments": count, "thinking_enabled": provider == "deepseek" and label == "long"}
                 try:
-                    text = extract_page(data, name, candidate, thinking_enabled=row["thinking_enabled"], diagnostics=diagnostics, response_observer=lambda raw: row.update(raw=raw))
+                    text = api.extract_page_with_fallback(api.OWNER_ID, data, name, row["thinking_enabled"],
+                        {"_processing_config": candidate, "include_sfx": True, "_ocr_diagnostics": diagnostics,
+                         "_ocr_response_observer": lambda raw: row.update(raw=raw)})
                     row.update(text=text, correct_text_and_order=evaluate(text),
                                requests=len(calls), attachments=[c["attachments"] for c in calls])
-                    row["passed"] = row["correct_text_and_order"] and len(calls) == 1 and calls[0]["attachments"] == count
+                    row["recovery_needed"] = len(calls) > 1
+                    row["used_provider"] = calls[-1]["provider"] if calls else "qwen"
+                    row["passed"] = row["correct_text_and_order"] and bool(calls) and all(c["attachments"] == count for c in calls)
                     if provider != "dark":
                         cid = provider_thread(provider).get("conversation_id")
                         conversation = conversation or cid
-                        report["conversation_checks"][provider] = bool(cid and cid == conversation) and report["conversation_checks"].get(provider, True)
+                        row["conversation_changed_after_failure"] = bool(row["recovery_needed"] and cid != conversation)
+                        report["conversation_checks"][provider] = bool(cid and (cid == conversation or row["recovery_needed"])) and report["conversation_checks"].get(provider, True)
                 except Exception as exc:
                     row.update(text="", passed=False, error=api.sanitize_error(exc), requests=len(calls))
                 row["seconds"] = round(time.monotonic() - started, 1)

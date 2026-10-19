@@ -2763,7 +2763,9 @@ def extract_text_from_single_image(user_id, image_bytes, image_name, thinking_en
         config = replace(config, ocr_scope="all" if (settings or {}).get("include_sfx", False) else "dialogue")
         return extract_page(image_bytes, image_name, config,
                             bubble_spacing=(settings or {}).get("bubble_spacing", True), progress=progress_cb,
-                            thinking_enabled=thinking_enabled)
+                            thinking_enabled=thinking_enabled,
+                            diagnostics=(settings or {}).get("_ocr_diagnostics"),
+                            response_observer=(settings or {}).get("_ocr_response_observer"))
     last_error = None
 
     try:
@@ -4105,7 +4107,8 @@ async def on_ready():
     print(emojize(f"{emoji_manager.placeholder('circlecheck')} ZEUS text bot جاهز (v{BOT_VERSION})"))
     try:
         from utils.providers import import_owner_cookie_file
-        await asyncio.to_thread(import_owner_cookie_file)
+        if await asyncio.to_thread(import_owner_cookie_file):
+            print("[Gemini] Owner cookie export saved to MongoDB.")
     except Exception:
         print("[Gemini] تعذر استيراد ملف الكوكيز؛ لم تُعرض قيم الجلسة.")
     if os.getenv("PUBLIC_FILE_BASE_URL") or os.getenv("RAILWAY_PUBLIC_DOMAIN"):

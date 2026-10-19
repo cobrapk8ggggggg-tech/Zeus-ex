@@ -143,15 +143,16 @@ def _clean_regions(payload):
     for index, region in enumerate(regions):
         if isinstance(region, str):
             region = {"text": region}
-        if isinstance(region, dict) and "text" not in region:
+        if isinstance(region, dict):
             # GPT-OCR currently folds text values into JSON property names:
             # {"text:SOURCE,box":[...],"kind:caption,illegible":false}.
             # Recover the literal value, without rewriting or guessing its text.
             region = dict(region)
             for key, value in list(region.items()):
                 match = re.fullmatch(r"text:([\s\S]*),box", key)
-                if match:
-                    region.update(text=match.group(1), box=value)
+                if match and "text" not in region:
+                    # This endpoint also changes coordinate units unpredictably.
+                    region.update(text=match.group(1), box=value, _unreliable_box=True)
                 match = re.fullmatch(r"kind:([^,]+),illegible", key)
                 if match:
                     region.update(kind=match.group(1), illegible=value is True)
@@ -168,7 +169,7 @@ def _clean_regions(payload):
         if isinstance(box, list) and len(box) == 4 and all(
                 isinstance(n, (int, float)) and not isinstance(n, bool) and 0 <= n <= 1 for n in box):
             box = [n * 1000 for n in box]
-        synthetic = not isinstance(box, list) or len(box) != 4 or any(
+        synthetic = region.get("_unreliable_box", False) or not isinstance(box, list) or len(box) != 4 or any(
             isinstance(n, bool) or not isinstance(n, (float, int)) or not 0 <= n <= 1000 for n in box
         ) or box[2] <= box[0] or box[3] <= box[1]
         if synthetic:
@@ -183,6 +184,12 @@ def _clean_regions(payload):
         clean.append({"text": "⟦غير مقروء⟧" if marked or not text else text, "box": box,
                       "kind": str(region.get("kind", "speech")), "synthetic_box": synthetic,
                       "illegible": bool(region.get("illegible")) or marked})
+    if any(r["synthetic_box"] for r in clean):
+        # A mixture of invented and real coordinates would reorder the text.
+        # Use the provider's top-to-bottom list consistently for this part.
+        for index, item in enumerate(clean):
+            top = index * 1000 / max(1, len(clean))
+            item.update(box=[0, top, 1000, top + 500 / max(1, len(clean))], synthetic_box=True)
     return clean
 
 
@@ -230,25 +237,23 @@ def extract_page(data, name, config, *, bubble_spacing=True, progress=None, diag
     # Conversation resets and provider fallback belong to the chapter coordinator.
     if diagnostics:
         diagnostics({"event": "batch_request", "page": name, "attachments": len(crops),
-                     "source_height": crops[-1].core_bottom, "attempt": 1})
+                     "source_height": crops[-1].core_bottom, "attempt": 1, "provider": config.provider})
     raw = complete_external(config.provider, prompt, images, config=config, max_attempts=1,
                             thinking_enabled=thinking_enabled)
     if response_observer:
         response_observer(raw)
     sections = parse_parts(raw, len(crops))
     records = []
-    for crop, regions in zip(crops, sections):
+    for part_index, (crop, regions) in enumerate(zip(crops, sections)):
         scale = (crop.bottom - crop.top) / 1000
         for item in regions:
             left, top, right, bottom = item["box"]
             absolute = [left, crop.top + top * scale, right, crop.top + bottom * scale]
             if config.ocr_scope == "dialogue" and item["kind"].lower() in ("sfx", "sound", "sound_effect"):
                 continue
-            if not item["synthetic_box"] and not crop.core_top <= (absolute[1] + absolute[3]) / 2 < crop.core_bottom:
-                continue
             if any(_overlap(r["box"], absolute) > .35 and
                    SequenceMatcher(None, r["text"], item["text"]).ratio() > .85 for r in records):
                 continue
-            records.append({**item, "box": absolute})
-    records.sort(key=lambda r: (r["box"][1], r["box"][0]))
+            records.append({**item, "box": absolute, "part_index": part_index})
+    records.sort(key=lambda r: (r["part_index"], r["box"][1], r["box"][0]))
     return ("\n\n" if bubble_spacing else "\n").join(r["text"] for r in records)

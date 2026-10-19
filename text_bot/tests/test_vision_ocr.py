@@ -162,3 +162,14 @@ class FlexibleResponseTests(unittest.TestCase):
             text=extract_page(sample(18000),"page.png",ProcessingConfig(provider="dark"))
         request.assert_called_once()
         self.assertEqual(text,"FIRST PANEL 27769\n\nSECOND PANEL 94037\n\nLAST PANEL 29608")
+
+    def test_mixed_invalid_and_valid_boxes_preserve_the_providers_reading_order(self):
+        raw=batch([(1,[region("FIRST",[10,800,900,900]),region("SECOND",[1,2,1,2]),region("LAST",[10,100,900,200])])])
+        with patch("utils.vision_ocr.complete_external",return_value=raw):
+            text=extract_page(sample(),"page.png",ProcessingConfig(provider="gemini"))
+        self.assertEqual(text,"FIRST\n\nSECOND\n\nLAST")
+
+    def test_actual_dark_pixel_boxes_cannot_drop_middle_or_last_parts(self):
+        raw='{"parts":[{"part":1,"regions":[{"text:FIRST,box":[3,4,110,22],"kind:caption,illegible":false}]},{"part":2,"regions":[{"text:SECOND,box":[1,4,110,22],"kind:caption,illegible":false}]},{"part":3,"regions":[{"text:LAST,box":[1,3,110,22],"kind:caption,illegible":false}]}]}'
+        with patch("utils.vision_ocr.complete_external",return_value=raw):
+            self.assertEqual(extract_page(sample(18000),"page.png",ProcessingConfig(provider="dark")),"FIRST\n\nSECOND\n\nLAST")

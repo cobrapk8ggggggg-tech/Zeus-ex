@@ -4,3 +4,4 @@ python-dotenv
 requests
 user-agent
 Pillow
+pypdfium2

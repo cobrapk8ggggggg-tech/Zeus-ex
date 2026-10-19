@@ -367,3 +367,35 @@ class ThinkingSwitchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class DarkPDFAndErrorTests(unittest.TestCase):
+    @patch("utils.providers.requests.Session")
+    def test_upstream_text_error_is_not_delivered_as_extracted_text(self, factory):
+        factory.return_value.post.return_value = response(lines=[
+            b'data: {"text":"Something went wrong. Please try again."}',b'',b'data: {"done":true}',b''])
+        with self.assertRaises(RuntimeError):
+            providers.complete_external("dark","extract",config=providers.ProcessingConfig(provider="dark"))
+
+    def test_scanned_pdf_pages_are_rendered_in_order_with_a_clear_limit(self):
+        pdf=io.BytesIO()
+        Image.new("RGB",(20,40),"red").save(pdf,format="PDF",save_all=True,
+            append_images=[Image.new("RGB",(20,40),"blue")])
+        pages=providers.DarkOCRClient.pdf_pages(pdf.getvalue(),"chapter.pdf",10)
+        self.assertEqual([p[1] for p in pages],["chapter.page-0001.png","chapter.page-0002.png"])
+        first=Image.open(io.BytesIO(pages[0][0])).getpixel((0,0))
+        second=Image.open(io.BytesIO(pages[1][0])).getpixel((0,0))
+        self.assertGreater(first[0],first[2]);self.assertGreater(second[2],second[0])
+        with self.assertRaises(providers.ProviderConfigurationError):
+            providers.DarkOCRClient.pdf_pages(pdf.getvalue(),"chapter.pdf",1)
+
+    @patch("utils.providers.requests.Session")
+    def test_pdf_attachment_is_sent_as_image_links_in_one_request(self, factory):
+        pdf=io.BytesIO();Image.new("RGB",(20,40),"white").save(pdf,format="PDF")
+        config=providers.ProcessingConfig(provider="dark")
+        factory.return_value.post.return_value=response(lines=[b'data: {"text":"OK"}',b'',b'data: {"done":true}',b''])
+        with patch("utils.file_links.temporary_links") as lease:
+            lease.return_value.__enter__.return_value=["https://files.test/assets/page"]
+            providers.complete_external("dark","extract",files=[(pdf.getvalue(),"chapter.pdf")],config=config)
+        attachments=lease.call_args.args[0]
+        self.assertTrue(attachments[0][0].startswith(b'\x89PNG'))
+        factory.return_value.post.assert_called_once()
