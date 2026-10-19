@@ -243,3 +243,26 @@ class CapabilityAndSettingsTests(unittest.IsolatedAsyncioTestCase):
                         {"_processing_config":config,"include_sfx":enabled,"bubble_spacing":False})
                 self.assertEqual(extract.call_args.args[2].ocr_scope,"all" if enabled else "dialogue")
                 self.assertFalse(extract.call_args.kwargs["bubble_spacing"])
+
+    async def test_bad_primary_credentials_do_not_block_an_available_image_backup(self):
+        settings={"_processing_config":ProcessingConfig(provider="gpt",chatgpt_access_token="expired")}
+        destination=SimpleNamespace(send=AsyncMock())
+        self.assertTrue(await bot.ensure_provider_available(destination,settings))
+        destination.send.assert_not_awaited()
+
+    async def test_failed_page_is_marked_without_losing_later_page_order(self):
+        def extract(user,data,name,*args,**kwargs):
+            if name=="02.png":
+                raise RuntimeError("all offline")
+            return "FIRST" if name=="01.png" else "LAST"
+        settings={"_processing_config":ProcessingConfig(provider="dark")}
+        with patch.object(bot,"extract_page_with_fallback",side_effect=extract), \
+             patch.object(bot,"edit_status",new_callable=AsyncMock):
+            text,empty,failed,pages=await bot.run_extraction_pipeline(None,1,
+                [(b"a","01.png"),(b"b","02.png"),(b"c","03.png")],False,settings)
+        self.assertEqual(failed,["02.png"])
+        self.assertEqual(empty,0)
+        self.assertEqual(pages["02.png"],"")
+        self.assertIn("تعذر استخراج",text)
+        self.assertLess(text.index("FIRST"),text.index("02.png"))
+        self.assertLess(text.index("02.png"),text.index("LAST"))

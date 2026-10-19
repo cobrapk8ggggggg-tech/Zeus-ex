@@ -93,7 +93,7 @@ class VisionTests(unittest.TestCase):
         self.assertIn("last", text)
 
     def test_invalid_or_truncated_json_is_rejected(self):
-        for raw in ('{"regions":[', '{"regions":[{"text":"x","box":[1,2,1,2]}]}'):
+        for raw in ('{"regions":[',):
             with self.assertRaises(RuntimeError):
                 parse_regions(raw)
 
@@ -133,3 +133,32 @@ class FlexibleResponseTests(unittest.TestCase):
             with patch("utils.vision_ocr.complete_external", return_value=raw):
                 text = extract_page(sample(), "page.png", ProcessingConfig(provider="gpt", ocr_scope=scope))
             self.assertEqual("BANG" in text, scope == "all")
+
+    def test_refusals_retry_but_real_dialogue_is_preserved(self):
+        for text in ("I CANNOT LET YOU GO!", "لا أستطيع تركك وحدك", "UNFORTUNATELY, YOU LOST."):
+            self.assertEqual(parse_parts(text,1)[0][0]["text"],text)
+        for text in ("I cannot access the image. Please upload it.","لا أستطيع قراءة الصورة المرفقة."):
+            with self.assertRaises(RuntimeError):
+                parse_parts(text,1)
+
+    def test_narrative_does_not_allow_salvaging_a_partial_json_batch(self):
+        with self.assertRaises(RuntimeError):
+            parse_parts('Result:\n{"parts":[{"part":1,"regions":[{"text":"partial","box":[0,0,10,10]}]',1)
+
+    def test_optional_coordinate_metadata_never_discards_complete_transcription(self):
+        for box in ([1,2,1,2], [10,10,1200,1300], {"left":"10","top":"100","right":"900","bottom":"200"}):
+            raw=json.dumps({"regions":[{"text":"SOURCE TEXT", "box":box}]})
+            self.assertEqual(parse_parts(raw,1)[0][0]["text"],"SOURCE TEXT")
+
+    def test_actual_gpt_ocr_folded_json_keys_recover_literal_text_and_kind(self):
+        raw='{"parts":[{"part":1,"regions":[{"text:FIRST PANEL 27769,box":[133,99,624,156],"kind:caption,illegible":false},{"text:English, 中文 원문!,box":[120,182,648,239],"kind:sfx,illegible":false}]}]}'
+        regions=parse_parts(raw,1)[0]
+        self.assertEqual([r["text"] for r in regions],["FIRST PANEL 27769","English, 中文 원문!"])
+        self.assertEqual(regions[1]["kind"],"sfx")
+
+    def test_actual_gpt_ocr_three_part_response_recovers_all_parts_in_one_call(self):
+        raw='{"parts":[{"part":1,"regions":[{"text:FIRST PANEL 27769,box":[105,29,136,43],"kind:caption,illegible":false}]},{"part":2,"regions":[{"text:SECOND PANEL 94037,box":[101,27,136,42],"kind:caption,illegible":false}]},{"part":3,"regions":[{"text:LAST PANEL 29608,box":[100,40,135,54],"kind:caption,illegible":false}]}]}'
+        with patch("utils.vision_ocr.complete_external",return_value=raw) as request:
+            text=extract_page(sample(18000),"page.png",ProcessingConfig(provider="dark"))
+        request.assert_called_once()
+        self.assertEqual(text,"FIRST PANEL 27769\n\nSECOND PANEL 94037\n\nLAST PANEL 29608")

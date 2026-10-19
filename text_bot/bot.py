@@ -375,7 +375,7 @@ async def deliver_extraction_result(channel, user_id, *, combined_text, translat
     if failed_pages:
         failed_note = "تعذّرت قراءة صفحة واحدة" if len(failed_pages) == 1 else f"تعذّرت قراءة `{len(failed_pages)}` صفحة"
         failed_names = ", ".join(f"`{name}`" for name in failed_pages[:5])
-        extra_line = f"{failed_note} حتى بعد إعادة المحاولة والتقسيم الذكي: {failed_names} — أعد استخراج هذه الصفحات إن أردت"
+        extra_line = f"{failed_note} بعد محاولات الإنقاذ: {failed_names} — أعد استخراج هذه الصفحات إن أردت"
         warning = f"{warning}\n{extra_line}" if warning else extra_line
 
     translation_info = None
@@ -3285,7 +3285,7 @@ async def _push_split_status(status_msg, stage, name, part, total_parts, label, 
             )
         elif stage == "recovery":
             await edit_status(status_msg, "جاري إنقاذ الصفحة",
-                f"الصفحة `{name}` — إعادة المحاولة بمحادثة جديدة، ثم مسار احتياطي عند الحاجة.",
+                f"الصفحة `{name}` — نعيد قراءتها لإكمال النص مع الحفاظ على ترتيب الفصل.",
                 current=current, total=total)
         elif stage == "split_fallback":
             await edit_status(
@@ -3406,7 +3406,7 @@ async def run_extraction_pipeline(status_msg, user_id, images, thinking_enabled,
             completed += 1
             detail = f"اكتملت معالجة `{completed}` من `{total_images}` صفحة."
             if failed_notices:
-                names = "، ".join(f"`{name}`" for name in list(failed_notices.keys())[:4])
+                names = "، ".join(f"`{images[idx - 1][1]}`" for idx in list(failed_notices.keys())[:4])
                 detail += f"\nصفحات لم تكتمل بعد محاولات الإنقاذ: {names}"
             async with progress_lock:
                 await edit_status(
@@ -3431,7 +3431,10 @@ async def run_extraction_pipeline(status_msg, user_id, images, thinking_enabled,
         text = page_texts.get(idx)
         if text is None:
             failed_pages.append(img_name)
-            text = ""
+            # Never turn a failed page into an apparently blank page in the file.
+            page_texts_by_name[img_name] = ""
+            combined_text += output_separator(settings, idx, img_name) + "⟦تعذر استخراج هذه الصفحة بعد محاولات الإنقاذ⟧"
+            continue
         page_texts_by_name[img_name] = (text or "")
         if not (text or "").strip():
             empty_images += 1
@@ -3504,6 +3507,15 @@ async def ensure_provider_available(destination, settings):
         validate_provider(settings)
         return True
     except ProviderConfigurationError as exc:
+        config = processing_config(settings)
+        for provider in ("gpt", "gemini", "deepseek", "dark"):
+            if provider == config.provider:
+                continue
+            try:
+                validate_provider({"_processing_config": replace(config, provider=provider)})
+                return True
+            except ProviderConfigurationError:
+                pass
         await destination.send(emojize("{emoji:circlex} " + str(exc)))
         return False
 
@@ -4235,6 +4247,9 @@ async def extract(interaction: discord.Interaction):
     await edit_status(status_msg, "بدأ الاستخراج الآن", f"تم العثور على `{total_images}` صورة.", current=0, total=total_images)
 
     combined_text, empty_images, failed_pages, page_texts = await run_extraction_pipeline(status_msg, user_id, images, thinking_enabled, settings)
+    if len(failed_pages) == total_images:
+        await edit_status(status_msg, "تعذر إكمال الاستخراج", "لم نتمكن من قراءة الصور بعد محاولات الإنقاذ. لم تُخصم نقطة؛ يمكنك إعادة المحاولة لاحقًا.", error=True)
+        return
 
     # مرحلة الترجمة الأدبية (اختيارية — معطلة افتراضيًا) — تتم من الصور نفسها بسياقها البصري
     translated_text, translated_error = await run_chapter_translation_stage(
@@ -4892,6 +4907,9 @@ async def prefix_extract(ctx):
     await edit_status(status_msg, "بدأ الاستخراج", f"تم العثور على `{total_images}` صورة.", current=0, total=total_images)
 
     combined_text, empty_images, failed_pages, page_texts = await run_extraction_pipeline(status_msg, user_id, images, thinking_enabled, settings)
+    if len(failed_pages) == total_images:
+        await edit_status(status_msg, "تعذر إكمال الاستخراج", "لم نتمكن من قراءة الصور بعد محاولات الإنقاذ. لم تُخصم نقطة؛ يمكنك إعادة المحاولة لاحقًا.", error=True)
+        return
 
     # مرحلة الترجمة الأدبية (اختيارية — معطلة افتراضيًا) — تتم من الصور نفسها بسياقها البصري
     translated_text, translated_error = await run_chapter_translation_stage(

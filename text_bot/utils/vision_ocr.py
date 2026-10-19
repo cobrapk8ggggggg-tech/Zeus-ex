@@ -101,7 +101,9 @@ def unwrap_response(raw):
                         payload = value
                         break
                 except ValueError:
-                    pass
+                    # Do not salvage a nested region from a truncated outer batch.
+                    if re.match(r'[\[{]\s*["{\[]', candidate[start.start():]):
+                        raise RuntimeError("رد الاستخراج يحتوي JSON غير مكتمل.") from None
             if payload is None:
                 continue
         for _ in range(4):
@@ -123,7 +125,7 @@ def unwrap_response(raw):
         return payload
     if not text or text.startswith(("{", "[")):
         raise RuntimeError("رد الاستخراج فارغ أو JSON غير مكتمل.")
-    if re.search(r"(?:I (?:cannot|can't|am unable)|unable to (?:read|view|access)|لا (?:أستطيع|يمكنني)|تعذر (?:عرض|قراءة))", text, re.I):
+    if re.search(r"(?:I (?:cannot|can't|am unable to)|unable to)\s+(?:read|view|access|see|process)\s+(?:(?:the|this|an?|your|attached)\s+){0,3}(?:image|file|attachment|picture)|(?:no image (?:was |is )?(?:provided|attached))|(?:لا (?:أستطيع|يمكنني)|تعذر)\s+(?:عرض|قراءة|رؤية)\s+(?:الصورة|الملف|المرفق)", text, re.I):
         raise RuntimeError("لم يتمكن المزود من قراءة المرفق.")
     return text
 
@@ -141,17 +143,39 @@ def _clean_regions(payload):
     for index, region in enumerate(regions):
         if isinstance(region, str):
             region = {"text": region}
+        if isinstance(region, dict) and "text" not in region:
+            # GPT-OCR currently folds text values into JSON property names:
+            # {"text:SOURCE,box":[...],"kind:caption,illegible":false}.
+            # Recover the literal value, without rewriting or guessing its text.
+            region = dict(region)
+            for key, value in list(region.items()):
+                match = re.fullmatch(r"text:([\s\S]*),box", key)
+                if match:
+                    region.update(text=match.group(1), box=value)
+                match = re.fullmatch(r"kind:([^,]+),illegible", key)
+                if match:
+                    region.update(kind=match.group(1), illegible=value is True)
         if not isinstance(region, dict) or not isinstance(region.get("text"), str):
             raise RuntimeError("أحد مقاطع الاستخراج غير صالح.")
         box = region.get("box")
-        synthetic = box is None
+        if isinstance(box, dict):
+            box = [box.get(k) for k in ("left", "top", "right", "bottom")]
+        if isinstance(box, (list, tuple)):
+            try:
+                box = [float(n) if isinstance(n, str) else n for n in box]
+            except ValueError:
+                box = None
+        if isinstance(box, list) and len(box) == 4 and all(
+                isinstance(n, (int, float)) and not isinstance(n, bool) and 0 <= n <= 1 for n in box):
+            box = [n * 1000 for n in box]
+        synthetic = not isinstance(box, list) or len(box) != 4 or any(
+            isinstance(n, bool) or not isinstance(n, (float, int)) or not 0 <= n <= 1000 for n in box
+        ) or box[2] <= box[0] or box[3] <= box[1]
         if synthetic:
+            # Coordinates are optional ordering metadata. Keep complete OCR text
+            # in the requested source order instead of failing a valid response.
             top = index * 1000 / max(1, len(regions))
             box = [0, top, 1000, top + 500 / max(1, len(regions))]
-        if not isinstance(box, list) or len(box) != 4 or any(
-            isinstance(n, bool) or not isinstance(n, (float, int)) or not 0 <= n <= 1000 for n in box
-        ) or box[2] <= box[0] or box[3] <= box[1]:
-            raise RuntimeError("إحداثيات النص غير صالحة.")
         text = " ".join(region["text"].split())
         marked = bool(re.fullmatch(r"[\[⟦<]\s*(?:illegible|unreadable|غير\s+مقروء)\s*[\]⟧>]", text, re.I))
         if not text and not region.get("illegible"):

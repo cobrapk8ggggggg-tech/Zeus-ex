@@ -220,11 +220,18 @@ def run_batch_validation(api, marker):
         positions = [norm.find(normalized(line)) for line in expected]
         return all(n >= 0 for n in positions) and positions == sorted(positions)
     print("[ZEUS_BATCH] " + json.dumps({"run": marker, "event": "started", "policy": report["policy"]}), flush=True)
+    previous = collection.find_one({"mode": "batch", "_id": {"$ne": marker}, "pdf_attachment": {"$exists": True}}, sort=[("started_at", -1)])
+    if previous:
+        print("[ZEUS_DARK_PDF_FIXTURE] " + json.dumps(previous["pdf_attachment"], ensure_ascii=False), flush=True)
     try:
         for provider, configured in (("gpt", bool(config.chatgpt_access_token)),
                                      ("gemini", bool(config.gemini_cookie_header)), ("dark", True), ("deepseek", bool(config.deepseek_token))):
             if not configured:
                 report.setdefault("skipped", []).append(provider)
+                continue
+            import os
+            allowed = os.getenv("ZEUS_VALIDATION_PROVIDERS", "gpt,gemini,dark,deepseek").split(",")
+            if provider not in allowed:
                 continue
             candidate = replace(config, provider=provider)
             initial = provider_thread(provider).get("conversation_id") if provider != "dark" else None
@@ -237,9 +244,9 @@ def run_batch_validation(api, marker):
                 def diagnostics(detail):
                     calls.append(detail)
                 started = time.monotonic()
-                row = {"name": name, "provider": provider, "expected_attachments": count}
+                row = {"name": name, "provider": provider, "expected_attachments": count, "thinking_enabled": provider == "deepseek" and label == "long"}
                 try:
-                    text = extract_page(data, name, candidate, diagnostics=diagnostics, response_observer=lambda raw: row.update(raw=raw))
+                    text = extract_page(data, name, candidate, thinking_enabled=row["thinking_enabled"], diagnostics=diagnostics, response_observer=lambda raw: row.update(raw=raw))
                     row.update(text=text, correct_text_and_order=evaluate(text),
                                requests=len(calls), attachments=[c["attachments"] for c in calls])
                     row["passed"] = row["correct_text_and_order"] and len(calls) == 1 and calls[0]["attachments"] == count
@@ -273,6 +280,7 @@ def run_batch_validation(api, marker):
             answer = complete_external("dark", "Copy every printed line in this PDF in top-to-bottom order. Return text only.",
                                        files=[(pdf.getvalue(), "fixture.pdf")], config=replace(config, provider="dark"), max_attempts=1)
             report["pdf_attachment"] = {"passed": evaluate(answer), "text": answer}
+            print("[ZEUS_DARK_PDF_FIXTURE] " + json.dumps(report["pdf_attachment"], ensure_ascii=False), flush=True)
             save()
         passed = all(p["passed"] for p in report["pages"]) and all(report["conversation_checks"].values())
         passed &= report.get("url_lifecycle", {}).get("passed", False) and report.get("pdf_attachment", {}).get("passed", False)
